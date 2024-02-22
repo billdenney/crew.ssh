@@ -1,0 +1,19 @@
+Package: crew.ssh
+Title: 'crew' Launcher Plugin for Running on a Remote System with 'ssh'
+Version: 0.0.0.9000
+Authors@R: 
+    person("Bill", "Denney", email="wdenney@humanpredictions.com", role=c("aut", "cre"), comment=c(ORCID="0000-0002-5759-428X"))
+Description: In computationally demanding analysis projects, statisticians and
+  data scientists may asynchronously deploy long-running tasks to remote
+  systems by 'ssh'. This extends the 'crew' package with worker launcher plugins
+  for remote systems by 'ssh'.
+License: GPL (>= 3)
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
+Imports: 
+    crew,
+    ssh
+Suggests: 
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
