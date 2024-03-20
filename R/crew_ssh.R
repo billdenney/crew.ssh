@@ -85,13 +85,13 @@ crew_controller_ssh <- function(
     seconds_launch = 30,
     seconds_idle = Inf,
     seconds_wall = Inf,
-    seconds_exit = 1,
     tasks_max = Inf,
     tasks_timers = 0L,
     reset_globals = TRUE,
     reset_packages = FALSE,
     reset_options = FALSE,
-    garbage_collection = FALSE
+    garbage_collection = FALSE,
+    launch_max = 5L
 ) {
   client <- crew::crew_client(
     name = name,
@@ -109,16 +109,18 @@ crew_controller_ssh <- function(
     ssh_passwd = ssh_passwd,
     ssh_verbose = ssh_verbose,
     seconds_interval = seconds_interval,
+    seconds_timeout = seconds_timeout,
     seconds_launch = seconds_launch,
     seconds_idle = seconds_idle,
     seconds_wall = seconds_wall,
-    seconds_exit = seconds_exit,
     tasks_max = tasks_max,
     tasks_timers = tasks_timers,
     reset_globals = reset_globals,
     reset_packages = reset_packages,
     reset_options = reset_options,
-    garbage_collection = garbage_collection
+    garbage_collection = garbage_collection,
+    launch_max = 5L,
+    tls = tls
   )
   controller <- crew::crew_controller(client = client, launcher = launcher)
   controller$validate()
