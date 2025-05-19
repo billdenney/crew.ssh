@@ -5,12 +5,10 @@
 \title{Create a controller with the ssh launcher.}
 \usage{
 crew_controller_ssh(
-  name = "ssh controller name",
   ssh_host,
   ssh_keyfile = NULL,
   ssh_passwd = "",
   ssh_verbose = FALSE,
-  workers = 1L,
   host = NULL,
   port = NULL,
   tls = crew::crew_tls(),
@@ -19,33 +17,31 @@ crew_controller_ssh(
   seconds_launch = 30,
   seconds_idle = Inf,
   seconds_wall = Inf,
-  seconds_exit = 1,
   tasks_max = Inf,
   tasks_timers = 0L,
   reset_globals = TRUE,
   reset_packages = FALSE,
   reset_options = FALSE,
-  garbage_collection = FALSE
+  garbage_collection = FALSE,
+  launch_max = 5L
 )
 }
 \arguments{
-\item{name}{Name of the client object. If \code{NULL}, a name is automatically
-generated.}
-
-\item{workers}{Integer, maximum number of parallel workers to run.}
-
 \item{host}{IP address of the \code{mirai} client to send and receive tasks.
 If \code{NULL}, the host defaults to the local IP address.}
 
 \item{port}{TCP port to listen for the workers. If \code{NULL},
-then an available ephemeral port is automatically chosen.}
+then an available ephemeral port is automatically chosen.
+Controllers running simultaneously on the same computer
+(as in a controller group) must not share the same TCP port.}
 
 \item{tls}{A TLS configuration object from \code{\link[crew:crew_tls]{crew_tls()}}.}
 
 \item{seconds_interval}{Number of seconds between
 polling intervals waiting for certain internal
-synchronous operations to complete,
-such as checking \code{mirai::status()}}
+synchronous operations to complete. In certain cases, exponential
+backoff is used with this argument passed to \code{seconds_max}
+in a \code{\link[crew:crew_throttle]{crew_throttle()}} object.}
 
 \item{seconds_timeout}{Number of seconds until timing
 out while waiting for certain synchronous operations to complete,
@@ -71,9 +67,6 @@ The timer does not launch until \code{tasks_timers} tasks
 have completed.
 See the \code{walltime} argument of \code{mirai::daemon()}.}
 
-\item{seconds_exit}{Deprecated on 2023-09-21 in version 0.5.0.9002.
-No longer necessary.}
-
 \item{tasks_max}{Maximum number of tasks that a worker will do before
 exiting. See the \code{maxtasks} argument of \code{mirai::daemon()}.
 \code{crew} does not
@@ -98,6 +91,9 @@ because packages sometimes rely on options they set at loading time.}
 
 \item{garbage_collection}{\code{TRUE} to run garbage collection between
 tasks, \code{FALSE} to skip.}
+
+\item{launch_max}{Deprecated on 2024-11-04 (\code{crew} version 0.10.2.9002).
+Use \code{crashes_error} instead.}
 }
 \description{
 Create an \code{R6} object to submit tasks and launch workers.

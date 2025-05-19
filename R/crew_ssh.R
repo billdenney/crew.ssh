@@ -27,6 +27,9 @@ ssh_launcher_class <- R6::R6Class(
     #' @param call,name,launcher,worker,instance As used with
     #'   `crew::crew_class_launcher$launch_worker()`
     launch_worker = function(call, name, launcher, worker, instance) {
+      if (self$ssh_verbose) {
+        message("Connecting to: ", self$ssh_host)
+      }
       private$session <-
         ssh::ssh_connect(
           host = self$ssh_host,
@@ -34,19 +37,29 @@ ssh_launcher_class <- R6::R6Class(
           passwd = self$ssh_passwd,
           verbose = self$ssh_verbose
         )
-      # Track the PID and PID start time to ensure that only the correct job is
-      # killed.  Solution based on
-      # https://stackoverflow.com/questions/5731234/how-to-get-the-start-time-of-a-long-running-linux-process
-      ps_start_time <- 'date --date="$(ps -p $! -o lstart=)" "+%s"'
+      # Dameonize the R session
+      command_to_run <- sprintf("start-stop-daemon --start --background --make-pidfile --pidfile /var/run/rcrew.pid --user root --name root --startas /usr/local/bin/R -- -e %s &", shQuote(call))
+      if (self$ssh_verbose) {
+        message("Running: ", command_to_run)
+      }
+      daemon_start <-
+        ssh::ssh_exec_internal(
+          session = private$session,
+          command = command_to_run
+        )
+      if (length(daemon_start$out) > 0) {
+        message("stdout output from starting R daemon:\n", rawToChar(pid_lstart$stderr))
+      }
+      if (length(daemon_start$stderr) > 0) {
+        message("stderr output from starting R daemon:\n", rawToChar(pid_lstart$stderr))
+      }
+      # Track the PID to ensure that only the correct job is killed.
       pid_lstart <-
         ssh::ssh_exec_internal(
           session = private$session,
-          command = sprintf("R -e %s & echo $! $(%s)", shQuote(call), ps_start_time)
+          command = "cat /var/run/rcrew.pid"
         )
-      setNames(
-        strsplit(x = rawToChar(pid_lstart$stdout), split = " ")[[1]],
-        c("pid", "start_time")
-      )
+      trimws(rawToChar(pid_lstart$stdout))
     },
     #' @param handle As used with `crew::crew_class_launcher$terminate_worker()`
     terminate_worker = function(handle) {
@@ -60,7 +73,8 @@ ssh_launcher_class <- R6::R6Class(
   ),
   private = list(
     session = NULL
-  )
+  ),
+  cloneable = FALSE
 )
 
 #' Create a controller with the ssh launcher.
@@ -71,12 +85,10 @@ ssh_launcher_class <- R6::R6Class(
 #' @inheritParams ssh::ssh_connect
 #' @export
 crew_controller_ssh <- function(
-    name = "ssh controller name",
     ssh_host,
     ssh_keyfile = NULL,
     ssh_passwd = "",
     ssh_verbose = FALSE,
-    workers = 1L,
     host = NULL,
     port = NULL,
     tls = crew::crew_tls(),
@@ -94,8 +106,6 @@ crew_controller_ssh <- function(
     launch_max = 5L
 ) {
   client <- crew::crew_client(
-    name = name,
-    workers = workers,
     host = host,
     port = port,
     tls = tls,
@@ -103,7 +113,6 @@ crew_controller_ssh <- function(
     seconds_timeout = seconds_timeout
   )
   launcher <- ssh_launcher_class$new(
-    name = name,
     ssh_host = ssh_host,
     ssh_keyfile = ssh_keyfile,
     ssh_passwd = ssh_passwd,
