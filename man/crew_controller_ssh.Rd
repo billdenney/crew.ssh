@@ -37,6 +37,14 @@ crew_controller_ssh(
 \item{name}{Character string, name of the launcher. If the name is
 \code{NULL}, then a name is automatically generated when the launcher starts.}
 
+\item{ssh_host}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
+
+\item{ssh_keyfile}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
+
+\item{ssh_passwd}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
+
+\item{ssh_verbose}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
+
 \item{workers}{Maximum number of workers to run concurrently
 when auto-scaling, excluding task retries and manual calls to \code{launch()}.
 Special workers allocated for task retries

@@ -92,6 +92,10 @@ ssh_launcher_class <- R6::R6Class(
 #'
 #' Create an `R6` object to submit tasks and launch workers.
 #'
+#' @param ssh_host Passed to [ssh::ssh_connect()]
+#' @param ssh_keyfile Passed to [ssh::ssh_connect()]
+#' @param ssh_passwd Passed to [ssh::ssh_connect()]
+#' @param ssh_verbose Passed to [ssh::ssh_connect()]
 #' @inheritParams crew::crew_controller_local
 #' @inheritParams ssh::ssh_connect
 #' @export
