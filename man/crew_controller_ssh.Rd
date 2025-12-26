@@ -5,15 +5,19 @@
 \title{Create a controller with the ssh launcher.}
 \usage{
 crew_controller_ssh(
+  name = "ssh controller",
   ssh_host,
   ssh_keyfile = NULL,
   ssh_passwd = "",
   ssh_verbose = FALSE,
+  workers = 1L,
   host = NULL,
   port = NULL,
   tls = crew::crew_tls(),
+  serialization = NULL,
+  profile = crew::crew_random_name(),
   seconds_interval = 0.5,
-  seconds_timeout = 10,
+  seconds_timeout = 30,
   seconds_launch = 30,
   seconds_idle = Inf,
   seconds_wall = Inf,
@@ -23,12 +27,26 @@ crew_controller_ssh(
   reset_packages = FALSE,
   reset_options = FALSE,
   garbage_collection = FALSE,
-  launch_max = 5L
+  r_arguments = NULL,
+  options_metrics = crew::crew_options_metrics(),
+  crashes_max = 5L,
+  backup = NULL
 )
 }
 \arguments{
+\item{name}{Character string, name of the launcher. If the name is
+\code{NULL}, then a name is automatically generated when the launcher starts.}
+
+\item{workers}{Maximum number of workers to run concurrently
+when auto-scaling, excluding task retries and manual calls to \code{launch()}.
+Special workers allocated for task retries
+do not count towards this limit, so the number of workers running at a
+given time may exceed this maximum.
+A smaller number of workers may run if the number of executing tasks
+is smaller than the supplied value of the \code{workers} argument.}
+
 \item{host}{IP address of the \code{mirai} client to send and receive tasks.
-If \code{NULL}, the host defaults to the local IP address.}
+If \code{NULL}, the host defaults to \code{nanonext::ip_addr()[1]}.}
 
 \item{port}{TCP port to listen for the workers. If \code{NULL},
 then an available ephemeral port is automatically chosen.
@@ -36,6 +54,15 @@ Controllers running simultaneously on the same computer
 (as in a controller group) must not share the same TCP port.}
 
 \item{tls}{A TLS configuration object from \code{\link[crew:crew_tls]{crew_tls()}}.}
+
+\item{serialization}{Either \code{NULL} (default) or an object produced by
+\code{\link[mirai:serial_config]{mirai::serial_config()}} to control the serialization
+of data sent to workers. This can help with either more efficient
+data transfers or to preserve attributes of otherwise
+non-exportable objects (such as \code{torch} tensors or \code{arrow} tables).
+See \code{?mirai::serial_config} for details.}
+
+\item{profile}{Character string, compute profile for \code{\link[mirai:daemons]{mirai::daemons()}}.}
 
 \item{seconds_interval}{Number of seconds between
 polling intervals waiting for certain internal
@@ -45,7 +72,7 @@ in a \code{\link[crew:crew_throttle]{crew_throttle()}} object.}
 
 \item{seconds_timeout}{Number of seconds until timing
 out while waiting for certain synchronous operations to complete,
-such as checking \code{mirai::status()}.}
+such as checking \code{mirai::info()}.}
 
 \item{seconds_launch}{Seconds of startup time to allow.
 A worker is unconditionally assumed to be alive
@@ -68,11 +95,8 @@ have completed.
 See the \code{walltime} argument of \code{mirai::daemon()}.}
 
 \item{tasks_max}{Maximum number of tasks that a worker will do before
-exiting. See the \code{maxtasks} argument of \code{mirai::daemon()}.
-\code{crew} does not
-excel with perfectly transient workers because it does not micromanage
-the assignment of tasks to workers, it is recommended to set
-\code{tasks_max} to a value greater than 1.}
+exiting. Also determines how often the controller auto-scales.
+See the Auto-scaling section for details.}
 
 \item{tasks_timers}{Number of tasks to do before activating
 the timers for \code{seconds_idle} and \code{seconds_wall}.
@@ -81,19 +105,66 @@ See the \code{timerstart} argument of \code{mirai::daemon()}.}
 \item{reset_globals}{\code{TRUE} to reset global environment
 variables between tasks, \code{FALSE} to leave them alone.}
 
-\item{reset_packages}{\code{TRUE} to unload any packages loaded during
-a task (runs between each task), \code{FALSE} to leave packages alone.}
+\item{reset_packages}{\code{TRUE} to detach any packages loaded during
+a task (runs between each task), \code{FALSE} to leave packages alone.
+In either case, the namespaces are not detached.}
 
 \item{reset_options}{\code{TRUE} to reset global options to their original
 state between each task, \code{FALSE} otherwise. It is recommended to
 only set \code{reset_options = TRUE} if \code{reset_packages} is also \code{TRUE}
-because packages sometimes rely on options they set at loading time.}
+because packages sometimes rely on options they set at loading time.
+for this and other reasons, \code{reset_options} only resets options
+that were nonempty at the beginning of the task.
+If your task sets an entirely new option not already in \code{options()},
+then \code{reset_options = TRUE} does not delete the option.}
 
-\item{garbage_collection}{\code{TRUE} to run garbage collection between
-tasks, \code{FALSE} to skip.}
+\item{garbage_collection}{\code{TRUE} to run garbage collection after each task
+task, \code{FALSE} to skip.}
 
-\item{launch_max}{Deprecated on 2024-11-04 (\code{crew} version 0.10.2.9002).
-Use \code{crashes_error} instead.}
+\item{r_arguments}{Optional character vector of command line arguments
+to pass to \code{Rscript} (non-Windows) or \code{Rscript.exe} (Windows)
+when starting a worker. Example:
+\code{r_arguments = c("--vanilla", "--max-connections=32")}.}
+
+\item{options_metrics}{Either \code{NULL} to opt out of resource metric logging
+for workers, or an object from \code{\link[crew:crew_options_metrics]{crew_options_metrics()}} to enable
+and configure resource metric logging for workers.
+For resource logging to run,
+the \code{autometric} R package version 0.1.0 or higher
+must be installed.}
+
+\item{crashes_max}{In rare cases, a worker may exit unexpectedly
+before it completes its current task. If this happens, \code{pop()}
+returns a status of \code{"crash"} instead of \code{"error"} for the task.
+The controller does not automatically retry the task, but
+you can retry it manually by calling \code{push()} again and using the same
+task name as before. (However, \code{targets} pipelines running \code{crew}
+do automatically retry tasks whose workers crashed.)
+
+\code{crashes_max} is a non-negative integer, and it sets the maximum number of
+allowable consecutive crashes for a given task.
+If a task's worker crashes more than \code{crashes_max} times in a row,
+then \code{pop()} throws an error when it tries to return the results
+of the task.}
+
+\item{backup}{An optional \code{crew} controller object, or \code{NULL} to omit.
+If supplied, the \code{backup} controller runs any pushed tasks that have
+already reached \code{crashes_max} consecutive crashes.
+Using \code{backup}, you can create
+a chain of controllers with different levels of resources
+(such as worker memory and CPUs) so that a task that fails on
+one controller can retry using incrementally more powerful workers.
+All controllers in a backup chain should be part of the same
+controller group (see \code{\link[crew:crew_controller_group]{crew_controller_group()}}) so you can call the
+group-level \code{pop()} and \code{collect()} methods to make sure you get results
+regardless of which controller actually ended up running the task.
+
+Limitations of \code{backup}:
+* \code{crashes_max} needs to be positive in order for \code{backup} to be used.
+Otherwise, every task would always skip the current controller and
+go to \code{backup}.
+* \code{backup} cannot be a controller group. It must be an ordinary
+controller.}
 }
 \description{
 Create an \code{R6} object to submit tasks and launch workers.

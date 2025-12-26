@@ -22,6 +22,11 @@ This is a basic example which shows you how to solve a common problem:
 
 ``` r
 library(crew.ssh)
-## basic example code
+controller_ssh <-
+  crew_controller_ssh(
+    ssh_host = "computation@example.com",
+    ssh_verbose = TRUE,
+    ssh_passwd = "mypass"
+  )
 ```
 

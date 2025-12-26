@@ -1,3 +1,5 @@
+# Launcher ----
+
 #' Create an ssh job launcher object
 #'
 #' @export
@@ -26,7 +28,7 @@ ssh_launcher_class <- R6::R6Class(
     },
     #' @param call,name,launcher,worker,instance As used with
     #'   `crew::crew_class_launcher$launch_worker()`
-    launch_worker = function(call, name, launcher, worker, instance) {
+    launch_worker = function(call) {
       if (self$ssh_verbose) {
         message("Connecting to: ", self$ssh_host)
       }
@@ -38,7 +40,14 @@ ssh_launcher_class <- R6::R6Class(
           verbose = self$ssh_verbose
         )
       # Dameonize the R session
-      command_to_run <- sprintf("start-stop-daemon --start --background --make-pidfile --pidfile /var/run/rcrew.pid --user root --name root --startas /usr/local/bin/R -- -e %s &", shQuote(call))
+      # TODO: Put the pidfile in a better location
+      pidfile_path <- "/tmp/rcrew.pid"
+      command_to_run <-
+        sprintf(
+          "start-stop-daemon --start --background --make-pidfile --pidfile %s --user $(whoami) --name $(whoami) --startas /usr/local/bin/R -- -e %s &",
+          pidfile_path,
+          shQuote(call)
+        )
       if (self$ssh_verbose) {
         message("Running: ", command_to_run)
       }
@@ -48,16 +57,16 @@ ssh_launcher_class <- R6::R6Class(
           command = command_to_run
         )
       if (length(daemon_start$out) > 0) {
-        message("stdout output from starting R daemon:\n", rawToChar(pid_lstart$stderr))
+        message("stdout output from starting R daemon:\n", rawToChar(daemon_start$stderr))
       }
       if (length(daemon_start$stderr) > 0) {
-        message("stderr output from starting R daemon:\n", rawToChar(pid_lstart$stderr))
+        message("stderr output from starting R daemon:\n", rawToChar(daemon_start$stderr))
       }
       # Track the PID to ensure that only the correct job is killed.
       pid_lstart <-
         ssh::ssh_exec_internal(
           session = private$session,
-          command = "cat /var/run/rcrew.pid"
+          command = paste("cat", pidfile_path)
         )
       trimws(rawToChar(pid_lstart$stdout))
     },
@@ -77,6 +86,8 @@ ssh_launcher_class <- R6::R6Class(
   cloneable = FALSE
 )
 
+# Controller ----
+
 #' Create a controller with the ssh launcher.
 #'
 #' Create an `R6` object to submit tasks and launch workers.
@@ -85,15 +96,19 @@ ssh_launcher_class <- R6::R6Class(
 #' @inheritParams ssh::ssh_connect
 #' @export
 crew_controller_ssh <- function(
+    name = "ssh controller",
     ssh_host,
     ssh_keyfile = NULL,
     ssh_passwd = "",
     ssh_verbose = FALSE,
+    workers = 1L,
     host = NULL,
     port = NULL,
     tls = crew::crew_tls(),
+    serialization = NULL,
+    profile = crew::crew_random_name(),
     seconds_interval = 0.5,
-    seconds_timeout = 10,
+    seconds_timeout = 30,
     seconds_launch = 30,
     seconds_idle = Inf,
     seconds_wall = Inf,
@@ -103,12 +118,16 @@ crew_controller_ssh <- function(
     reset_packages = FALSE,
     reset_options = FALSE,
     garbage_collection = FALSE,
-    launch_max = 5L
-) {
+    r_arguments = NULL,
+    options_metrics = crew::crew_options_metrics(),
+    crashes_max = 5L,
+    backup = NULL) {
   client <- crew::crew_client(
     host = host,
     port = port,
     tls = tls,
+    serialization = serialization,
+    profile = profile,
     seconds_interval = seconds_interval,
     seconds_timeout = seconds_timeout
   )
@@ -117,6 +136,8 @@ crew_controller_ssh <- function(
     ssh_keyfile = ssh_keyfile,
     ssh_passwd = ssh_passwd,
     ssh_verbose = ssh_verbose,
+    name = name,
+    workers = workers,
     seconds_interval = seconds_interval,
     seconds_timeout = seconds_timeout,
     seconds_launch = seconds_launch,
@@ -124,14 +145,20 @@ crew_controller_ssh <- function(
     seconds_wall = seconds_wall,
     tasks_max = tasks_max,
     tasks_timers = tasks_timers,
+    tls = tls,
+    r_arguments = r_arguments,
+    options_metrics = options_metrics
+  )
+  controller <- crew::crew_controller(
+    client = client,
+    launcher = launcher,
     reset_globals = reset_globals,
     reset_packages = reset_packages,
     reset_options = reset_options,
     garbage_collection = garbage_collection,
-    launch_max = 5L,
-    tls = tls
+    crashes_max = crashes_max,
+    backup = backup
   )
-  controller <- crew::crew_controller(client = client, launcher = launcher)
   controller$validate()
   controller
 }
