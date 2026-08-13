@@ -10,10 +10,15 @@ Description: In computationally demanding analysis projects, statisticians and
 License: GPL (>= 3)
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.3.3
-Imports: 
-    crew,
-    ssh
-Suggests: 
+Depends:
+    R (>= 4.1.0)
+Imports:
+    crew (>= 1.3.0),
+    processx,
+    R6
+Suggests:
+    targets (>= 1.11.0),
     testthat (>= 3.0.0)
+SystemRequirements: OpenSSH client (the ssh command)
 Config/testthat/edition: 3
+Config/roxygen2/version: 8.0.0

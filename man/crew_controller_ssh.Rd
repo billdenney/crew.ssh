@@ -2,24 +2,29 @@
 % Please edit documentation in R/crew_ssh.R
 \name{crew_controller_ssh}
 \alias{crew_controller_ssh}
-\title{Create a controller with the ssh launcher.}
+\title{Create a controller with an \code{ssh} launcher.}
 \usage{
 crew_controller_ssh(
-  name = "ssh controller",
   ssh_host,
+  ssh_port = NULL,
   ssh_keyfile = NULL,
-  ssh_passwd = "",
-  ssh_verbose = FALSE,
+  ssh_options = character(0L),
+  ssh_command = "ssh",
+  rscript = "Rscript",
+  directory = NULL,
+  remote_directory = "/tmp",
+  verbose = FALSE,
+  name = NULL,
   workers = 1L,
-  host = NULL,
+  host = "127.0.0.1",
   port = NULL,
   tls = crew::crew_tls(),
   serialization = NULL,
   profile = crew::crew_random_name(),
-  seconds_interval = 0.5,
-  seconds_timeout = 30,
+  seconds_interval = 0.25,
+  seconds_timeout = 60,
   seconds_launch = 30,
-  seconds_idle = Inf,
+  seconds_idle = 300,
   seconds_wall = Inf,
   tasks_max = Inf,
   tasks_timers = 0L,
@@ -27,23 +32,46 @@ crew_controller_ssh(
   reset_packages = FALSE,
   reset_options = FALSE,
   garbage_collection = FALSE,
-  r_arguments = NULL,
+  r_arguments = c("--no-save", "--no-restore"),
   options_metrics = crew::crew_options_metrics(),
   crashes_max = 5L,
   backup = NULL
 )
 }
 \arguments{
+\item{ssh_host}{Character of length 1, the \code{ssh} destination of the remote
+system, e.g. \code{"user@example.com"}. Anything the \code{ssh} command accepts
+works here, including a \code{Host} alias from \verb{~/.ssh/config}.}
+
+\item{ssh_port}{Positive integer of length 1 or \code{NULL}, the port of the
+remote \code{ssh} server (\code{ssh -p}). \code{NULL} uses the \code{ssh} default.}
+
+\item{ssh_keyfile}{Character of length 1 or \code{NULL}, path to the private key
+file to authenticate with (\code{ssh -i}). \code{NULL} uses the keys \code{ssh} would
+choose on its own.}
+
+\item{ssh_options}{Character vector of additional arguments for the \code{ssh}
+command, e.g. \code{c("-o", "ProxyJump=bastion")}. Options given here take
+precedence over the ones the launcher sets.}
+
+\item{ssh_command}{Character of length 1, the \code{ssh} executable to run.}
+
+\item{rscript}{Character of length 1, path to \code{Rscript} on the remote
+system.}
+
+\item{directory}{Character of length 1 or \code{NULL}, working directory of the
+workers on the remote system. \code{NULL} means the directory \code{ssh} lands in,
+usually the remote home directory.}
+
+\item{remote_directory}{Character of length 1, absolute path to a directory
+on the remote system where the launcher may write worker scripts and
+logs.}
+
+\item{verbose}{Logical of length 1, whether to print messages about the
+tunnel and each worker launch.}
+
 \item{name}{Character string, name of the launcher. If the name is
 \code{NULL}, then a name is automatically generated when the launcher starts.}
-
-\item{ssh_host}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
-
-\item{ssh_keyfile}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
-
-\item{ssh_passwd}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
-
-\item{ssh_verbose}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
 
 \item{workers}{Maximum number of workers to run concurrently
 when auto-scaling, excluding task retries and manual calls to \code{launch()}.
@@ -53,8 +81,9 @@ given time may exceed this maximum.
 A smaller number of workers may run if the number of executing tasks
 is smaller than the supplied value of the \code{workers} argument.}
 
-\item{host}{IP address of the \code{mirai} client to send and receive tasks.
-If \code{NULL}, the host defaults to \code{nanonext::ip_addr()[1]}.}
+\item{host}{Character of length 1, local address of the \code{mirai} dispatcher.
+The default binds to the loopback interface, which is all the reverse
+\code{ssh} tunnel needs.}
 
 \item{port}{TCP port to listen for the workers. If \code{NULL},
 then an available ephemeral port is automatically chosen.
@@ -174,6 +203,48 @@ go to \code{backup}.
 * \code{backup} cannot be a controller group. It must be an ordinary
 controller.}
 }
-\description{
-Create an \code{R6} object to submit tasks and launch workers.
+\value{
+An \code{R6} controller object with an \code{ssh} launcher.
 }
+\description{
+Create an \code{R6} object to submit tasks and launch workers on a
+remote system over \code{ssh}.
+}
+\details{
+Remote workers connect back to the local \code{mirai} dispatcher through
+a reverse \code{ssh} tunnel, so the local machine does not need to be reachable
+from the remote system. The dispatcher listens on the loopback interface
+by default and only the \code{ssh} connection leaves the machine.
+
+The remote system needs R with the \code{crew} package installed, and the
+\code{mirai} and \code{nanonext} versions on both ends should match. Any package a
+task uses must be installed on the remote system too.
+}
+\section{Use with \code{targets}}{
+
+Set \code{tar_option_set(storage = "main", retrieval = "main")} unless the
+remote system mounts the same filesystem as the local one. The \code{targets}
+default of \code{storage = "worker"} has each worker read and write
+\verb{_targets/objects/} itself, which a worker on another machine cannot do:
+the local process waits for files that never appear and the pipeline fails
+with "File sync timed out". With \code{"main"}, target data travels over the
+\code{ssh} tunnel along with the task. If the remote system does mount the
+project directory, pass \code{directory} instead so workers start there and the
+\code{targets} defaults keep working.
+}
+
+\examples{
+if (identical(Sys.getenv("CREW_SSH_EXAMPLES"), "true")) {
+controller <- crew_controller_ssh(ssh_host = "user@example.com")
+controller$start()
+controller$push(Sys.info()[["nodename"]])
+controller$wait()
+controller$pop()
+controller$terminate()
+}
+}
+\seealso{
+Other plugin_ssh:
+\code{\link{crew_class_launcher_ssh}}
+}
+\concept{plugin_ssh}
