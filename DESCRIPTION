@@ -17,8 +17,11 @@ Imports:
     processx,
     R6
 Suggests:
+    knitr,
+    rmarkdown,
     targets (>= 1.11.0),
     testthat (>= 3.0.0)
+VignetteBuilder: knitr
 SystemRequirements: OpenSSH client (the ssh command)
 Config/testthat/edition: 3
 Config/roxygen2/version: 8.0.0

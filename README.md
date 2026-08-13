@@ -62,6 +62,9 @@ controller$terminate()
 
 ## Use with `targets`
 
+`vignette("crew.ssh")` covers this in full, including routing individual
+targets to the remote machine and what to do about long-running pipelines.
+
 Set the controller in `_targets.R`, and set `storage` and `retrieval` to
 `"main"`:
 
