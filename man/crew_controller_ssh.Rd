@@ -2,7 +2,7 @@
 % Please edit documentation in R/crew_ssh.R
 \name{crew_controller_ssh}
 \alias{crew_controller_ssh}
-\title{Create a controller with the ssh launcher.}
+\title{Create a controller with the SSH launcher}
 \usage{
 crew_controller_ssh(
   name = "ssh controller",
@@ -10,16 +10,18 @@ crew_controller_ssh(
   ssh_keyfile = NULL,
   ssh_passwd = "",
   ssh_verbose = FALSE,
+  rscript_path = "Rscript",
+  remote_log_dir = "/tmp",
   workers = 1L,
   host = NULL,
   port = NULL,
   tls = crew::crew_tls(),
   serialization = NULL,
   profile = crew::crew_random_name(),
-  seconds_interval = 0.5,
-  seconds_timeout = 30,
+  seconds_interval = 0.25,
+  seconds_timeout = 60,
   seconds_launch = 30,
-  seconds_idle = Inf,
+  seconds_idle = 300,
   seconds_wall = Inf,
   tasks_max = Inf,
   tasks_timers = 0L,
@@ -37,13 +39,22 @@ crew_controller_ssh(
 \item{name}{Character string, name of the launcher. If the name is
 \code{NULL}, then a name is automatically generated when the launcher starts.}
 
-\item{ssh_host}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
+\item{ssh_host}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}. Format: \code{"user@hostname"}
+or \code{"user@hostname:port"}.}
 
-\item{ssh_keyfile}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
+\item{ssh_keyfile}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}. Path to SSH private key.}
 
-\item{ssh_passwd}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
+\item{ssh_passwd}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}.}
 
-\item{ssh_verbose}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}}
+\item{ssh_verbose}{Passed to \code{\link[ssh:ssh]{ssh::ssh_connect()}}.}
+
+\item{rscript_path}{Path to \code{Rscript} on the remote server. Defaults to
+\code{"Rscript"}, relying on the remote \code{PATH}. Override if \code{Rscript} is not
+on the default \code{PATH}, e.g. \code{"/usr/local/bin/Rscript"}.}
+
+\item{remote_log_dir}{Directory on the remote server where worker R scripts
+and log files are written. Worker scripts are deleted on termination; log
+files are kept for debugging. Defaults to \code{"/tmp"}.}
 
 \item{workers}{Maximum number of workers to run concurrently
 when auto-scaling, excluding task retries and manual calls to \code{launch()}.
@@ -175,5 +186,8 @@ go to \code{backup}.
 controller.}
 }
 \description{
-Create an \code{R6} object to submit tasks and launch workers.
+Creates an \code{R6} controller that submits tasks to workers launched on a
+remote system via SSH. The remote system must be able to reach the local
+machine on the network — the \code{host} argument must be set to the local
+machine's IP address as seen from the remote server (not \code{"127.0.0.1"}).
 }
