@@ -14,6 +14,8 @@ RoxygenNote: 7.3.3
 Imports: 
     crew,
     ssh
-Suggests: 
+Suggests:
+    nanonext,
+    ps,
     testthat (>= 3.0.0)
 Config/testthat/edition: 3
