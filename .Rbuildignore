@@ -3,4 +3,5 @@
 ^LICENSE\.md$
 ^\.github$
 ^\.claude$
+^\.git$
 ^local-testing\.R$

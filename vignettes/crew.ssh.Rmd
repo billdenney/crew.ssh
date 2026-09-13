@@ -1,0 +1,290 @@
+---
+title: "Running targets on a remote machine over ssh"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Running targets on a remote machine over ssh}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+`crew.ssh` lets a [`targets`](https://docs.ropensci.org/targets/) pipeline run
+its work on another machine. The pipeline, the `_targets/` data store, and your
+R session all stay where they are; only the computation moves.
+
+You can send the whole pipeline to the remote machine, or route individual
+targets there and keep the rest local. Both are covered below.
+
+## Before you start
+
+Three things have to be true.
+
+**1. `ssh` works without a prompt.** `crew.ssh` runs the `ssh` command with
+`BatchMode=yes`, so it can never stop to ask for a password or a passphrase.
+Check it from a terminal:
+
+```bash
+ssh -o BatchMode=yes user@example.com R --version
+```
+
+If that prints an R version, you are ready. If it asks for anything, fix the
+key setup first: use a key without a passphrase, or load a
+passphrase-protected key into `ssh-agent`. Password authentication is not
+supported.
+
+`ssh_host` is passed straight to `ssh`, so a `Host` alias from `~/.ssh/config`
+works too, and that is the best place to put a jump host, a non-standard port,
+or a specific key:
+
+```
+Host bigbox
+  HostName example.com
+  User me
+  IdentityFile ~/.ssh/id_ed25519
+  ProxyJump bastion.example.com
+```
+
+```{r}
+crew.ssh::crew_controller_ssh(ssh_host = "bigbox")
+```
+
+**2. The remote machine has R and `crew`.** It also needs every package your
+targets use. Version skew in `mirai` and `nanonext` between the two machines
+causes connection failures, so keep those aligned.
+
+**3. You have somewhere writable on the remote machine.** The default is
+`/tmp`; see `remote_directory` if that does not suit.
+
+## Send the whole pipeline to the remote machine
+
+Set one controller in `_targets.R`:
+
+```{r}
+library(targets)
+
+tar_option_set(
+  storage = "main",
+  retrieval = "main",
+  controller = crew.ssh::crew_controller_ssh(
+    ssh_host = "user@example.com",
+    workers = 4L
+  )
+)
+
+list(
+  tar_target(index, seq_len(8L)),
+  tar_target(piece, slow_function(index), pattern = map(index)),
+  tar_target(result, combine(piece))
+)
+```
+
+`tar_make()` then behaves normally. Targets are dispatched to workers on the
+remote machine, results come back over the `ssh` connection, and the data store
+stays on your machine.
+
+`workers` is the maximum number of remote R processes. `crew` starts them only
+as work demands and lets them exit after `seconds_idle` seconds of inactivity,
+so a large `workers` value costs nothing while the pipeline is idle.
+
+## Send only some targets to the remote machine
+
+Long or memory-hungry targets often deserve the big machine while everything
+else is faster to run locally. Combine controllers with
+`crew::crew_controller_group()` and pick one per target.
+
+Give each controller a `name`, set the default with `tar_option_set()`, and
+override it on the targets that should go elsewhere:
+
+```{r}
+library(targets)
+
+tar_option_set(
+  storage = "main",
+  retrieval = "main",
+  controller = crew::crew_controller_group(
+    crew::crew_controller_local(name = "local", workers = 2L),
+    crew.ssh::crew_controller_ssh(
+      name = "remote",
+      ssh_host = "user@example.com",
+      workers = 8L
+    )
+  ),
+  resources = tar_resources(crew = tar_resources_crew(controller = "local"))
+)
+
+on_remote <- tar_resources(crew = tar_resources_crew(controller = "remote"))
+
+list(
+  tar_target(index, seq_len(4L)),
+  tar_target(summary_table, quick_summary()),
+  tar_target(
+    fit,
+    expensive_model(index),
+    pattern = map(index),
+    resources = on_remote
+  ),
+  tar_target(report, assemble(summary_table, fit))
+)
+```
+
+`summary_table` and `report` run locally; the `fit` branches run on the remote
+machine. Targets with no `resources` of their own fall back to the
+`tar_option_set()` default, so the local controller stays the default and only
+the targets you mark travel.
+
+## Two settings that trip people up
+
+### `storage` and `retrieval` must be `"main"`
+
+Unless the remote machine mounts the same filesystem as your own, set both:
+
+```{r}
+tar_option_set(storage = "main", retrieval = "main")
+```
+
+`targets` otherwise defaults to `storage = "worker"`, where each worker reads
+and writes `_targets/objects/` itself. A worker on another machine writes into
+its own filesystem, your session waits for files that never appear, and the
+pipeline fails after about a minute with:
+
+```
+Error hashing output: timed out after retrying for 65 seconds.
+Path _targets/objects/<name> does not exist or has incorrect hash.
+File sync timed out.
+```
+
+With `"main"`, target data travels over the `ssh` connection along with the
+task and your session owns the store.
+
+The trade-off is that every input and result crosses the network. That is a
+good deal for targets that are slow to compute and modest in size, and a poor
+one for targets that do little to a lot of data.
+
+Because the remote machine has its own filesystem, a target that reads or
+writes a file by path only works if that path exists *there*. Ordinary
+in-memory targets need nothing extra.
+
+If the remote machine *does* mount your project directory, pass
+`directory = "/path/to/project"` so workers start in it, and leave `storage`
+and `retrieval` at their defaults.
+
+### Every package in `packages` must exist on the remote machine
+
+`tar_option_set(packages = ...)` defaults to whatever is attached when
+`_targets.R` is sourced, and `targets` loads all of them on each worker. A
+package that is attached locally but missing remotely fails the pipeline with:
+
+```
+could not find packages <name> in library paths
+```
+
+Set `packages` explicitly to the packages your targets actually need:
+
+```{r}
+tar_option_set(packages = c("dplyr", "mgcv"))
+```
+
+## When something goes wrong
+
+The most confusing failure is a worker that starts and then never connects.
+The reason is almost always in the worker's own output, which `crew.ssh` keeps
+in a log file per worker on the remote machine:
+
+```{r}
+controller <- crew.ssh::crew_controller_ssh(ssh_host = "user@example.com")
+controller$start()
+controller$push(1 + 1)
+controller$wait()
+
+cat(controller$launcher$logs(), sep = "\n")
+#> ==> /tmp/crew-ssh-9f2c.../worker-1a4b....log <==
+#> Error in loadNamespace(x) : there is no package called 'crew'
+```
+
+Inside a pipeline, reach the launcher through the controller you built:
+
+```{r}
+cat(tar_option_get("controller")$launcher$logs(), sep = "\n")
+```
+
+The logs outlive the workers, so they are still readable after a crash. Two
+other options help:
+
+* `verbose = TRUE` prints the tunnel command and a line per worker launch.
+* `rscript = "/path/to/Rscript"` fixes the common case where `Rscript` is not
+  on the `PATH` of a non-interactive `ssh` session. Check with
+  `ssh -o BatchMode=yes user@example.com which Rscript`.
+
+## Long-running pipelines and disconnecting
+
+The R session that calls `tar_make()` is the pipeline. It owns the data store,
+hands out every task, and hosts the connection the remote workers dial into.
+When it exits, the workers exit with it — deliberately, so that a closed laptop
+does not leave stray R processes on a shared server.
+
+So you cannot start a pipeline, close your session, and reattach to it later.
+What you get instead is that **finished work is never lost**. `targets` commits
+each target to the store as it completes, so re-running `tar_make()` skips
+everything that finished and re-runs only what was in flight:
+
+```{r}
+# Session dies after 5 of 8 branches.
+tar_make()
+
+# Later, in a new session:
+tar_make()
+#> ✔ ended pipeline [39.2s, 4 completed, 5 skipped]
+```
+
+For a pipeline that must survive you logging off entirely, run the pipeline
+itself on the remote machine rather than driving it from your laptop. Put the
+project there, start it detached, and come back to it:
+
+```bash
+ssh user@example.com
+cd ~/project
+nohup Rscript -e 'targets::tar_make()' > run.log 2>&1 &
+exit
+```
+
+Then reconnect whenever you like and inspect the store in place:
+
+```bash
+ssh user@example.com "cd ~/project && Rscript -e 'targets::tar_progress()'"
+```
+
+In that arrangement the pipeline and its workers are both remote, so use
+`crew::crew_controller_local()` in `_targets.R` — `crew.ssh` is not needed
+unless you are fanning work out to *further* machines. Choose based on where
+the pipeline needs to live:
+
+| You want | Where the pipeline runs | Controller |
+|---|---|---|
+| Interactive work, heavy compute elsewhere | Your machine | `crew_controller_ssh()` |
+| A run that survives logging off | The remote machine | `crew_controller_local()`, started under `nohup` or `tmux` |
+
+Brief network interruptions are survivable in the first arrangement: the
+tunnel tolerates roughly 90 seconds of silence, and `crew.ssh` reopens it if it
+does drop, so later workers reconnect without restarting the pipeline.
+
+## How it works
+
+1. The `mirai` dispatcher listens on your loopback interface.
+2. `crew.ssh` opens one long-lived `ssh` process with a reverse tunnel
+   (`ssh -R`). The remote `sshd` picks a free port, so nothing collides with
+   other users.
+3. Each worker launch is a short `ssh` call that pipes the worker's R script
+   over standard input, starts it detached with `nohup`, and returns its remote
+   process ID.
+4. Workers dial the remote end of the tunnel instead of your machine's address.
+5. The tunnel process holds the write end of its own standard input. When your
+   R session ends, however abruptly, the operating system closes that pipe and
+   the tunnel exits, which shuts the remote workers down with it.
+
+The practical consequence of step 2 is that your machine never has to be
+reachable from the remote one. No inbound firewall rule, no port forwarding,
+and no routable address — everything travels inside the `ssh` connection you
+were already allowed to make.

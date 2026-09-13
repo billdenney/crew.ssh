@@ -1,284 +1,256 @@
-# The integration tests at the end of this file need a remote host that has R
-# and crew installed and that accepts key-based SSH.  Name one in
-# CREW_SSH_TEST_HOST (for example "user@host.example.com"), optionally with a
-# key in CREW_SSH_TEST_KEYFILE; with neither set, those tests skip and the unit
-# tests below still run.
-ssh_host <- Sys.getenv("CREW_SSH_TEST_HOST", unset = "")
-ssh_keyfile <- Sys.getenv("CREW_SSH_TEST_KEYFILE", unset = "")
-if (!nzchar(ssh_keyfile)) {
-  ssh_keyfile <- NULL
+test_that("crew_controller_ssh() creates a valid controller", {
+  controller <- crew_controller_ssh(ssh_host = "user@example.com")
+  expect_s3_class(controller, "crew_class_controller")
+  expect_s3_class(controller$launcher, "crew_class_launcher_ssh")
+  expect_silent(controller$validate())
+  # The dispatcher only has to be reachable through the tunnel, so it stays on
+  # the loopback interface.
+  expect_equal(controller$client$host, "127.0.0.1")
+})
+
+test_that("the launcher rejects malformed arguments", {
+  expect_error(
+    crew_controller_ssh(ssh_host = c("a", "b")),
+    class = "crew_error"
+  )
+  expect_error(
+    crew_controller_ssh(ssh_host = "user@example.com", rscript = ""),
+    class = "crew_error"
+  )
+  expect_error(
+    crew_controller_ssh(ssh_host = "user@example.com", remote_directory = "tmp"),
+    class = "crew_error"
+  )
+  expect_error(
+    crew_controller_ssh(
+      ssh_host = "user@example.com",
+      remote_directory = "~/tmp"
+    ),
+    class = "crew_error"
+  )
+  expect_error(
+    crew_controller_ssh(ssh_host = "user@example.com", ssh_port = -1L),
+    class = "crew_error"
+  )
+  expect_error(
+    crew_controller_ssh(ssh_host = "user@example.com", ssh_options = NA),
+    class = "crew_error"
+  )
+  expect_error(
+    crew_controller_ssh(ssh_host = "user@example.com", verbose = "yes"),
+    class = "crew_error"
+  )
+  expect_error(
+    crew_controller_ssh(ssh_host = "user@example.com", directory = c("a", "b")),
+    class = "crew_error"
+  )
+})
+
+test_that("ssh_args() honors ssh_port, ssh_keyfile, and ssh_options", {
+  launcher <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    ssh_port = 2222,
+    ssh_keyfile = "/home/user/.ssh/id_ed25519",
+    ssh_options = c("-o", "ProxyJump=bastion")
+  )$launcher
+  args <- launcher$.__enclos_env__$private$ssh_args()
+  expect_equal(args[1:2], c("-o", "ProxyJump=bastion"))
+  expect_true(all(c("-p", "2222") %in% args))
+  expect_true(all(c("-i", "/home/user/.ssh/id_ed25519") %in% args))
+  expect_true("BatchMode=yes" %in% args)
+  # ssh honors the first occurrence of an option, so user options must lead.
+  expect_lt(match("ProxyJump=bastion", args), match("BatchMode=yes", args))
+})
+
+test_that("ssh_args() omits the port and key when they are NULL", {
+  launcher <- crew_controller_ssh(ssh_host = "user@example.com")$launcher
+  args <- launcher$.__enclos_env__$private$ssh_args()
+  expect_equal(args, c("-o", "BatchMode=yes"))
+})
+
+test_that("parse_url() splits a dispatcher URL on the last colon", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com"
+  )$launcher$.__enclos_env__$private
+  expect_equal(
+    private$parse_url("tcp://127.0.0.1:5000"),
+    list(scheme = "tcp", host = "127.0.0.1", port = "5000")
+  )
+  expect_equal(
+    private$parse_url("tls+tcp://192.168.0.155:44271"),
+    list(scheme = "tls+tcp", host = "192.168.0.155", port = "44271")
+  )
+  expect_equal(
+    private$parse_url("tcp://[::1]:5000"),
+    list(scheme = "tcp", host = "[::1]", port = "5000")
+  )
+  expect_error(private$parse_url("tcp://127.0.0.1"), class = "crew_error")
+  expect_error(private$parse_url("127.0.0.1:5000"), class = "crew_error")
+})
+
+test_that("worker_url() keeps the scheme and loopback host but takes the tunnel port", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com"
+  )$launcher$.__enclos_env__$private
+  private$.url <- "tcp://127.0.0.1:5000"
+  private$.tunnel_port <- "45678"
+  expect_equal(private$worker_url(), "tcp://127.0.0.1:45678")
+  private$.url <- "tls+tcp://127.0.0.1:5000"
+  expect_equal(private$worker_url(), "tls+tcp://127.0.0.1:45678")
+})
+
+test_that("the worker command uploads the script, detaches R, and reports the PID", {
+  launcher <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    rscript = "/usr/local/bin/Rscript",
+    r_arguments = c("--no-save", "--no-restore")
+  )$launcher
+  private <- launcher$.__enclos_env__$private
+  private$.session_directory <- "/tmp/crew-ssh-abc"
+  command <- private$worker_command(
+    script = "/tmp/crew-ssh-abc/worker-1.R",
+    log = "/tmp/crew-ssh-abc/worker-1.log"
+  )
+  expect_match(command, "^set -e; ", fixed = FALSE)
+  expect_match(command, "mkdir -p '/tmp/crew-ssh-abc';", fixed = TRUE)
+  expect_match(command, "cat > '/tmp/crew-ssh-abc/worker-1.R';", fixed = TRUE)
+  expect_match(
+    command,
+    "nohup '/usr/local/bin/Rscript' '--no-save' '--no-restore'",
+    fixed = TRUE
+  )
+  # Detaching every standard stream is what lets the ssh session return
+  # instead of waiting on the worker.
+  expect_match(
+    command,
+    "> '/tmp/crew-ssh-abc/worker-1.log' 2>&1 < /dev/null & echo $!",
+    fixed = TRUE
+  )
+  expect_no_match(command, "cd ", fixed = TRUE)
+})
+
+test_that("the worker command changes directory when asked", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    directory = "/home/user/project"
+  )$launcher$.__enclos_env__$private
+  private$.session_directory <- "/tmp/crew-ssh-abc"
+  command <- private$worker_command(script = "s.R", log = "s.log")
+  expect_match(command, "cd '/home/user/project';", fixed = TRUE)
+  # The directory change has to happen before R starts, not after.
+  expect_lt(
+    regexpr("cd '/home/user/project'", command, fixed = TRUE),
+    regexpr("nohup", command, fixed = TRUE)
+  )
+})
+
+test_that("the worker command quotes paths that would otherwise break the shell", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    rscript = "/opt/R 4.6/bin/Rscript",
+    directory = "/home/user/my project"
+  )$launcher$.__enclos_env__$private
+  private$.session_directory <- "/tmp/crew ssh"
+  command <- private$worker_command(script = "/tmp/crew ssh/w.R", log = "/l.log")
+  expect_match(command, "mkdir -p '/tmp/crew ssh';", fixed = TRUE)
+  expect_match(command, "cd '/home/user/my project';", fixed = TRUE)
+  expect_match(command, "nohup '/opt/R 4.6/bin/Rscript'", fixed = TRUE)
+  expect_match(command, "'/tmp/crew ssh/w.R'", fixed = TRUE)
+})
+
+test_that("logs() short-circuits before any worker has launched", {
+  launcher <- crew_controller_ssh(ssh_host = "user@example.com")$launcher
+  expect_equal(launcher$logs(), character(0L))
+})
+
+test_that("terminate() is a no-op before the launcher starts", {
+  launcher <- crew_controller_ssh(ssh_host = "user@example.com")$launcher
+  expect_silent(launcher$terminate())
+})
+
+# Live tests ----
+# These need a remote system that the ssh command can reach non-interactively
+# and that has R and crew installed. Point CREW_SSH_TEST_HOST at it, e.g.
+# Sys.setenv(CREW_SSH_TEST_HOST = "user@example.com").
+
+skip_without_host <- function() {
+  host <- Sys.getenv("CREW_SSH_TEST_HOST", unset = "")
+  testthat::skip_if(
+    !nzchar(host),
+    "CREW_SSH_TEST_HOST is not set, so live ssh tests are skipped."
+  )
+  host
 }
 
-# Unit tests (no SSH required) ----
-
-test_that("ssh_launcher_class stores all fields on initialize", {
-  launcher <- ssh_launcher_class$new(
-    name             = "test",
-    ssh_host         = "user@host",
-    ssh_keyfile      = "/path/to/key",
-    ssh_passwd       = "pw",
-    ssh_verbose      = TRUE,
-    rscript_path     = "/usr/bin/Rscript",
-    remote_log_dir   = "/var/log",
-    seconds_interval = 0.25
-  )
-  expect_equal(launcher$ssh_host,       "user@host")
-  expect_equal(launcher$ssh_keyfile,    "/path/to/key")
-  expect_equal(launcher$ssh_passwd,     "pw")
-  expect_true(launcher$ssh_verbose)
-  expect_equal(launcher$rscript_path,   "/usr/bin/Rscript")
-  expect_equal(launcher$remote_log_dir, "/var/log")
-})
-
-test_that("terminate() with no launched workers returns without error", {
-  launcher <- ssh_launcher_class$new(name = "test", ssh_host = "user@host", seconds_interval = 0.25)
-  expect_no_error(launcher$terminate())
-})
-
-test_that("launch_worker returns a correctly shaped handle", {
-  fake_session <- structure(list(), class = "ssh_session")
-
-  local_mocked_bindings(
-    ssh_connect = function(...) fake_session,
-    scp_upload  = function(...) invisible(NULL),
-    ssh_exec_internal = function(session, command) {
-      list(status = 0L, stdout = charToRaw("12345\n"), stderr = raw(0))
-    },
-    .package = "ssh"
-  )
-
-  launcher <- ssh_launcher_class$new(name = "test", ssh_host = "user@host", seconds_interval = 0.25)
-  handle <- launcher$launch_worker(call = 'crew::crew_worker(settings = list())')
-
-  expect_named(handle, c("id", "pid", "session", "remote_script", "remote_log"),
-               ignore.order = TRUE)
-  expect_equal(handle$pid, "12345")
-  expect_identical(handle$session, fake_session)
-  expect_match(handle$remote_script, "^/tmp/rcrew_worker_")
-  expect_match(handle$remote_log,    "^/tmp/rcrew_worker_")
-})
-
-test_that("launch_worker uses remote_log_dir in remote paths", {
-  fake_session  <- structure(list(), class = "ssh_session")
-  uploaded_to   <- NULL
-
-  local_mocked_bindings(
-    ssh_connect = function(...) fake_session,
-    scp_upload  = function(session, files, to) { uploaded_to <<- to; invisible(NULL) },
-    ssh_exec_internal = function(session, command) {
-      list(status = 0L, stdout = charToRaw("55555\n"), stderr = raw(0))
-    },
-    .package = "ssh"
-  )
-
-  launcher <- ssh_launcher_class$new(
-    name             = "test",
-    ssh_host         = "user@host",
-    remote_log_dir   = "/var/tmp",
-    seconds_interval = 0.25
-  )
-  handle <- launcher$launch_worker(call = 'crew::crew_worker(settings = list())')
-
-  expect_match(uploaded_to, "^/var/tmp/rcrew_worker_.*\\.R$")
-  expect_equal(handle$remote_script, uploaded_to)
-  expect_match(handle$remote_log,    "^/var/tmp/rcrew_worker_.*\\.log$")
-})
-
-test_that("launch_worker stops on non-zero remote exit status", {
-  fake_session <- structure(list(), class = "ssh_session")
-  disconnected <- FALSE
-
-  local_mocked_bindings(
-    ssh_connect = function(...) fake_session,
-    scp_upload  = function(...) invisible(NULL),
-    ssh_exec_internal = function(session, command) {
-      list(status = 1L, stdout = raw(0), stderr = charToRaw("Rscript: not found\n"))
-    },
-    ssh_disconnect = function(...) { disconnected <<- TRUE; invisible(NULL) },
-    .package = "ssh"
-  )
-
-  launcher <- ssh_launcher_class$new(name = "test", ssh_host = "user@host", seconds_interval = 0.25)
-  expect_error(
-    launcher$launch_worker(call = 'crew::crew_worker(settings = list())'),
-    "Failed to launch remote R worker"
-  )
-  expect_true(disconnected)
-})
-
-test_that("launch_worker stops when PID output is non-numeric", {
-  fake_session <- structure(list(), class = "ssh_session")
-
-  local_mocked_bindings(
-    ssh_connect = function(...) fake_session,
-    scp_upload  = function(...) invisible(NULL),
-    ssh_exec_internal = function(session, command) {
-      list(status = 0L, stdout = charToRaw("nohup: ignoring input\n"), stderr = raw(0))
-    },
-    ssh_disconnect = function(...) invisible(NULL),
-    .package = "ssh"
-  )
-
-  launcher <- ssh_launcher_class$new(name = "test", ssh_host = "user@host", seconds_interval = 0.25)
-  expect_error(
-    launcher$launch_worker(call = 'crew::crew_worker(settings = list())'),
-    "Could not determine PID"
-  )
-})
-
-test_that("launch_worker stops when PID output is empty", {
-  fake_session <- structure(list(), class = "ssh_session")
-
-  local_mocked_bindings(
-    ssh_connect = function(...) fake_session,
-    scp_upload  = function(...) invisible(NULL),
-    ssh_exec_internal = function(session, command) {
-      list(status = 0L, stdout = charToRaw("   \n"), stderr = raw(0))
-    },
-    ssh_disconnect = function(...) invisible(NULL),
-    .package = "ssh"
-  )
-
-  launcher <- ssh_launcher_class$new(name = "test", ssh_host = "user@host", seconds_interval = 0.25)
-  expect_error(
-    launcher$launch_worker(call = 'crew::crew_worker(settings = list())'),
-    "Could not determine PID"
-  )
-})
-
-test_that("terminate() disconnects all SSH sessions opened by launch_worker", {
-  fake_session    <- structure(list(), class = "ssh_session")
-  disconnect_count <- 0L
-
-  local_mocked_bindings(
-    ssh_connect = function(...) fake_session,
-    scp_upload  = function(...) invisible(NULL),
-    ssh_exec_internal = function(session, command) {
-      list(status = 0L, stdout = charToRaw("12345\n"), stderr = raw(0))
-    },
-    ssh_disconnect = function(...) { disconnect_count <<- disconnect_count + 1L; invisible(NULL) },
-    .package = "ssh"
-  )
-
-  launcher <- ssh_launcher_class$new(name = "test", ssh_host = "user@host", seconds_interval = 0.25)
-  launcher$launch_worker(call = 'crew::crew_worker(settings = list())')
-  launcher$launch_worker(call = 'crew::crew_worker(settings = list())')
-
-  launcher$terminate()
-  expect_equal(disconnect_count, 2L)
-})
-
-test_that("launch_worker with ssh_verbose emits messages", {
-  fake_session <- structure(list(), class = "ssh_session")
-
-  local_mocked_bindings(
-    ssh_connect = function(...) fake_session,
-    scp_upload  = function(...) invisible(NULL),
-    ssh_exec_internal = function(session, command) {
-      list(status = 0L, stdout = charToRaw("77777\n"), stderr = raw(0))
-    },
-    .package = "ssh"
-  )
-
-  launcher <- ssh_launcher_class$new(
-    name             = "test",
-    ssh_host         = "user@host",
-    ssh_verbose      = TRUE,
-    seconds_interval = 0.25
-  )
-  expect_message(
-    launcher$launch_worker(call = 'crew::crew_worker(settings = list())'),
-    "Connecting to"
-  )
-})
-
-test_that("crew_controller_ssh constructs and validates without error", {
-  skip_if_not_installed("crew")
-
-  controller <- crew_controller_ssh(
-    name        = "test-ssh",
-    ssh_host    = "user@host",
-    workers     = 1L,
-    host        = "127.0.0.1"
-  )
-  expect_true(inherits(controller, "R6"))
-  controller$terminate()
-})
-
-# Integration tests (require a remote host with crew installed) ----
-
-can_ssh <- nzchar(ssh_host) && tryCatch({
-  s <- ssh::ssh_connect(ssh_host, keyfile = ssh_keyfile)
-  r <- ssh::ssh_exec_internal(s, "Rscript -e 'cat(nzchar(system.file(package=\"crew\")))'")
-  crew_available <- identical(trimws(rawToChar(r$stdout)), "TRUE")
-  ssh::ssh_disconnect(s)
-  crew_available
-}, error = function(e) FALSE)
-
-test_that("a remote task runs on the configured host and returns its hostname", {
-  skip_on_cran()
-  skip_if(!can_ssh, "Set CREW_SSH_TEST_HOST to a remote host with crew installed")
-  skip_if_not_installed("ps")
-  skip_if_not_installed("nanonext")
-
-  local_hostname <- Sys.info()[["nodename"]]
-
-  local_host <- nanonext::ip_addr()[1]
-  message("Using host IP for controller: ", local_host)
-
-  controller <- crew_controller_ssh(
-    ssh_host       = ssh_host,
-    ssh_keyfile    = ssh_keyfile,
-    workers        = 1L,
-    seconds_idle   = 30,
-    seconds_launch = 120,
-    host           = local_host
-  )
-  on.exit(try(controller$terminate(), silent = TRUE), add = TRUE)
-
+test_that("tasks run on the remote system and results come back", {
+  host <- skip_without_host()
+  controller <- crew_controller_ssh(ssh_host = host, workers = 2L,
+                                    seconds_idle = 30)
+  on.exit(controller$terminate(), add = TRUE)
   controller$start()
+  # The tunnel gives the workers a loopback URL on the remote system, which is
+  # not the URL the dispatcher itself listens on.
+  expect_match(controller$launcher$settings()$url, "^tcp://127\\.0\\.0\\.1:[0-9]+$")
+  expect_false(identical(controller$launcher$settings()$url, controller$client$url))
   controller$push(
-    name    = "remote_info",
-    command = paste(Sys.info()[["nodename"]], ps::ps_pid())
+    command = list(node = Sys.info()[["nodename"]], value = 21L * 2L),
+    name = "remote"
   )
-  controller$wait(mode = "all", seconds_timeout = 300)
-  result <- controller$pop()
-
-  expect_false(is.null(result))
-  remote_info     <- result$result[[1]]
-  remote_hostname <- strsplit(remote_info, " ")[[1]][1]
-  expect_false(identical(remote_hostname, local_hostname),
-               label = "Worker should run on remote host, not locally")
+  controller$wait(mode = "all", seconds_timeout = 120)
+  out <- controller$pop()
+  expect_equal(out$name, "remote")
+  expect_true(is.na(out$error))
+  expect_equal(out$result[[1L]]$value, 42L)
+  expect_false(identical(out$result[[1L]]$node, Sys.info()[["nodename"]]))
 })
 
-test_that("multiple workers on the configured host each run tasks", {
-  skip_on_cran()
-  skip_if(!can_ssh, "Set CREW_SSH_TEST_HOST to a remote host with crew installed")
-  skip_if_not_installed("ps")
-  skip_if_not_installed("nanonext")
-
-  controller <- crew_controller_ssh(
-    ssh_host       = ssh_host,
-    ssh_keyfile    = ssh_keyfile,
-    workers        = 2L,
-    seconds_idle   = 30,
-    seconds_launch = 120,
-    host           = nanonext::ip_addr()[1]
-  )
-  on.exit(try(controller$terminate(), silent = TRUE), add = TRUE)
-
+test_that("worker errors travel back to the controller", {
+  host <- skip_without_host()
+  controller <- crew_controller_ssh(ssh_host = host, seconds_idle = 30)
+  on.exit(controller$terminate(), add = TRUE)
   controller$start()
-  for (i in seq_len(4L)) {
-    controller$push(
-      name    = paste0("task_", i),
-      command = ps::ps_pid(),
-      data    = list()
-    )
-  }
-  controller$wait(mode = "all", seconds_timeout = 300)
-  results <- controller$collect()
+  controller$push(command = stop("boom"), name = "bad")
+  controller$wait(mode = "all", seconds_timeout = 120)
+  out <- controller$pop()
+  expect_equal(out$error, "boom")
+})
 
-  expect_equal(nrow(results), 4L)
-  pids <- unlist(results$result)
-  expect_equal(length(pids), 4L)
+test_that("launch_worker() reports a remote PID and a readable log", {
+  host <- skip_without_host()
+  controller <- crew_controller_ssh(ssh_host = host, seconds_idle = 30)
+  on.exit(controller$terminate(), add = TRUE)
+  controller$start()
+  handle <- controller$launcher$launch_worker(controller$launcher$call())
+  expect_match(handle$pid, "^[0-9]+$")
+  expect_match(handle$script, "\\.R$")
+  expect_match(handle$log, "\\.log$")
+  expect_true(any(grepl(handle$name, controller$launcher$logs(lines = 5L))))
+})
+
+test_that("automatic TLS survives the port rewrite", {
+  host <- skip_without_host()
+  controller <- crew_controller_ssh(
+    ssh_host = host,
+    tls = crew::crew_tls(mode = "automatic"),
+    seconds_idle = 30
+  )
+  on.exit(controller$terminate(), add = TRUE)
+  controller$start()
+  # mirai derives the certificate common name from the dispatcher hostname, so
+  # only the port may differ between the two URLs.
+  expect_match(controller$launcher$settings()$url, "^tls\\+tcp://127\\.0\\.0\\.1:")
+  controller$push(command = 21L * 2L, name = "tls")
+  controller$wait(mode = "all", seconds_timeout = 120)
+  out <- controller$pop()
+  expect_true(is.na(out$error))
+  expect_equal(out$result[[1L]], 42L)
+})
+
+test_that("an unreachable host fails loudly instead of hanging", {
+  skip_without_host()
+  controller <- crew_controller_ssh(
+    ssh_host = "crew-ssh-no-such-host.invalid",
+    seconds_timeout = 30
+  )
+  expect_error(controller$start(), class = "crew_error")
 })
