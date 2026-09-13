@@ -11,6 +11,7 @@ crew_controller_ssh(
   ssh_options = character(0L),
   ssh_command = "ssh",
   rscript = "Rscript",
+  launch_prefix = character(0L),
   directory = NULL,
   remote_directory = "/tmp",
   verbose = FALSE,
@@ -59,9 +60,17 @@ precedence over the ones the launcher sets.}
 \item{rscript}{Character of length 1, path to \code{Rscript} on the remote
 system.}
 
+\item{launch_prefix}{Character vector, a command and its arguments to run
+the worker under, e.g.
+\code{c("docker", "run", "--rm", "--network=host", "my-image")}. Empty by
+default, which runs \code{rscript} directly. See the "Running workers in a
+container" section.}
+
 \item{directory}{Character of length 1 or \code{NULL}, working directory of the
 workers on the remote system. \code{NULL} means the directory \code{ssh} lands in,
-usually the remote home directory.}
+usually the remote home directory. This is the directory the command named
+by \code{launch_prefix} starts in, which for a container runtime is not the
+same as the working directory inside the container.}
 
 \item{remote_directory}{Character of length 1, absolute path to a directory
 on the remote system where the launcher may write worker scripts and
@@ -231,6 +240,38 @@ with "File sync timed out". With \code{"main"}, target data travels over the
 \code{ssh} tunnel along with the task. If the remote system does mount the
 project directory, pass \code{directory} instead so workers start there and the
 \code{targets} defaults keep working.
+}
+
+\section{Running workers in a container}{
+
+\code{launch_prefix} runs each worker under another command, which is how a
+worker runs inside a container instead of directly on the remote system:
+
+\if{html}{\out{<div class="sourceCode r">}}\preformatted{crew_controller_ssh(
+  ssh_host = "user@example.com",
+  launch_prefix = c(
+    "docker", "run", "--rm", "--network=host",
+    "--volume", "/tmp:/tmp", "my-image"
+  )
+)
+}\if{html}{\out{</div>}}
+
+Two details of the surrounding design decide what the prefix has to
+contain.
+
+The reverse \code{ssh} tunnel listens on the \emph{remote system's} loopback
+interface, and a container on a bridge network has a loopback of its own,
+so a worker there would dial a port nothing is listening on. The
+controller would then report a worker that launched but never connected.
+The container must share the remote system's network namespace:
+\code{--network=host} for \code{docker} and \code{podman}, which is already the default
+for \code{apptainer}.
+
+The launcher writes each worker's R script into \code{remote_directory} on the
+remote system and the worker reads it back by that same path, so
+\code{remote_directory} must be visible inside the container at the path it has
+outside. Worker logs are written by the remote shell rather than by the
+worker itself, so \code{logs()} keeps working whatever the prefix does.
 }
 
 \examples{

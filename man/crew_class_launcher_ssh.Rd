@@ -78,6 +78,7 @@ Other plugin_ssh:
   ssh_options = character(0L),
   ssh_command = "ssh",
   rscript = "Rscript",
+  launch_prefix = character(0L),
   directory = NULL,
   remote_directory = "/tmp",
   verbose = FALSE
@@ -105,9 +106,17 @@ occurrence of an option, so anything given here takes precedence.}
       \item{\code{rscript}}{Character of length 1, path to \code{Rscript} on the remote
 system. The default assumes \code{Rscript} is on the remote \code{PATH} for
 non-interactive \code{ssh} sessions.}
+      \item{\code{launch_prefix}}{Character vector, a command and its arguments to
+run the worker under, e.g.
+\code{c("docker", "run", "--rm", "--network=host", "my-image")}. Empty by
+default, which runs \code{rscript} directly. Each element is quoted for the
+remote shell separately, so an element may contain spaces without
+being split into two arguments.}
       \item{\code{directory}}{Character of length 1 or \code{NULL}, working directory of
 the workers on the remote system. \code{NULL} means the directory \code{ssh}
-lands in, usually the remote home directory.}
+lands in, usually the remote home directory. This is the directory the
+command named by \code{launch_prefix} starts in, which for a container
+runtime is not the same as the working directory inside the container.}
       \item{\code{remote_directory}}{Character of length 1, absolute path to a
 directory on the remote system where the launcher may write worker
 scripts and logs. Each controller gets its own uniquely named

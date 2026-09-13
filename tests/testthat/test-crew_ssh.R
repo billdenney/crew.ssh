@@ -158,6 +158,106 @@ test_that("the worker command quotes paths that would otherwise break the shell"
   expect_match(command, "'/tmp/crew ssh/w.R'", fixed = TRUE)
 })
 
+test_that("no launch_prefix leaves the worker command running Rscript directly", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com"
+  )$launcher$.__enclos_env__$private
+  private$.session_directory <- "/tmp/crew-ssh-abc"
+  command <- private$worker_command(script = "s.R", log = "s.log")
+  expect_match(command, "nohup 'Rscript' '--no-save'", fixed = TRUE)
+})
+
+test_that("launch_prefix runs the worker under a container runtime", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    launch_prefix = c(
+      "docker", "run", "--rm", "--network=host",
+      "--volume", "/tmp:/tmp", "my-image"
+    )
+  )$launcher$.__enclos_env__$private
+  private$.session_directory <- "/tmp/crew-ssh-abc"
+  expect_identical(
+    private$worker_command(
+      script = "/tmp/crew-ssh-abc/worker-1.R",
+      log = "/tmp/crew-ssh-abc/worker-1.log"
+    ),
+    paste0(
+      "set -e; mkdir -p '/tmp/crew-ssh-abc'; ",
+      "cat > '/tmp/crew-ssh-abc/worker-1.R'; ",
+      "nohup 'docker' 'run' '--rm' '--network=host' ",
+      "'--volume' '/tmp:/tmp' 'my-image' ",
+      "'Rscript' '--no-save' '--no-restore' ",
+      "'/tmp/crew-ssh-abc/worker-1.R' ",
+      "> '/tmp/crew-ssh-abc/worker-1.log' 2>&1 < /dev/null & echo $!"
+    )
+  )
+})
+
+test_that("the prefix precedes Rscript, and Rscript's arguments stay with Rscript", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    launch_prefix = c("docker", "run", "my-image"),
+    rscript = "/usr/local/bin/Rscript",
+    r_arguments = "--vanilla"
+  )$launcher$.__enclos_env__$private
+  private$.session_directory <- "/tmp/crew-ssh-abc"
+  # The arguments belong to the R inside the container, so they have to follow
+  # the image name rather than the container runtime.
+  expect_match(
+    private$worker_command(script = "s.R", log = "s.log"),
+    "nohup 'docker' 'run' 'my-image' '/usr/local/bin/Rscript' '--vanilla' 's.R'",
+    fixed = TRUE
+  )
+})
+
+test_that("a prefix element containing spaces stays a single argument", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    launch_prefix = c("docker", "run", "--volume", "/home/my data:/data", "img")
+  )$launcher$.__enclos_env__$private
+  private$.session_directory <- "/tmp/crew-ssh-abc"
+  expect_match(
+    private$worker_command(script = "s.R", log = "s.log"),
+    "'--volume' '/home/my data:/data' 'img'",
+    fixed = TRUE
+  )
+})
+
+test_that("launch_prefix rejects values the remote shell could not use", {
+  expect_error(
+    crew_controller_ssh(
+      ssh_host = "user@example.com",
+      launch_prefix = c("docker", NA_character_)
+    ),
+    class = "crew_error"
+  )
+  # An empty string would reach the shell as '', an empty argument.
+  expect_error(
+    crew_controller_ssh(
+      ssh_host = "user@example.com",
+      launch_prefix = c("docker", "")
+    ),
+    class = "crew_error"
+  )
+  expect_error(
+    crew_controller_ssh(ssh_host = "user@example.com", launch_prefix = 1L),
+    class = "crew_error"
+  )
+})
+
+test_that("an empty launch_prefix means no prefix", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    launch_prefix = character(0L)
+  )$launcher$.__enclos_env__$private
+  private$.session_directory <- "/tmp/crew-ssh-abc"
+  expect_match(
+    private$worker_command(script = "s.R", log = "s.log"),
+    "nohup 'Rscript'",
+    fixed = TRUE
+  )
+})
+
 test_that("logs() short-circuits before any worker has launched", {
   launcher <- crew_controller_ssh(ssh_host = "user@example.com")$launcher
   expect_equal(launcher$logs(), character(0L))

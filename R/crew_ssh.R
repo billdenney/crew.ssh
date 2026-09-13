@@ -51,9 +51,17 @@ crew_class_launcher_ssh <- R6::R6Class(
     #' @param rscript Character of length 1, path to `Rscript` on the remote
     #'   system. The default assumes `Rscript` is on the remote `PATH` for
     #'   non-interactive `ssh` sessions.
+    #' @param launch_prefix Character vector, a command and its arguments to
+    #'   run the worker under, e.g.
+    #'   `c("docker", "run", "--rm", "--network=host", "my-image")`. Empty by
+    #'   default, which runs `rscript` directly. Each element is quoted for the
+    #'   remote shell separately, so an element may contain spaces without
+    #'   being split into two arguments.
     #' @param directory Character of length 1 or `NULL`, working directory of
     #'   the workers on the remote system. `NULL` means the directory `ssh`
-    #'   lands in, usually the remote home directory.
+    #'   lands in, usually the remote home directory. This is the directory the
+    #'   command named by `launch_prefix` starts in, which for a container
+    #'   runtime is not the same as the working directory inside the container.
     #' @param remote_directory Character of length 1, absolute path to a
     #'   directory on the remote system where the launcher may write worker
     #'   scripts and logs. Each controller gets its own uniquely named
@@ -68,6 +76,7 @@ crew_class_launcher_ssh <- R6::R6Class(
       ssh_options = character(0L),
       ssh_command = "ssh",
       rscript = "Rscript",
+      launch_prefix = character(0L),
       directory = NULL,
       remote_directory = "/tmp",
       verbose = FALSE
@@ -79,6 +88,7 @@ crew_class_launcher_ssh <- R6::R6Class(
       private$.ssh_options <- ssh_options
       private$.ssh_command <- ssh_command
       private$.rscript <- rscript
+      private$.launch_prefix <- launch_prefix
       private$.directory <- directory
       private$.remote_directory <- remote_directory
       private$.verbose <- verbose
@@ -130,6 +140,19 @@ crew_class_launcher_ssh <- R6::R6Class(
         is.character(.),
         !anyNA(.),
         message = "ssh_options must be a character vector without NAs."
+      )
+      # An empty string would reach the remote shell as '', an empty argument,
+      # which the container runtime or wrapper would reject in a way that is
+      # hard to read back from a worker log.
+      crew::crew_assert(
+        private$.launch_prefix,
+        is.character(.),
+        !anyNA(.),
+        all(nzchar(.)),
+        message = paste(
+          "launch_prefix must be a character vector with no NAs and no",
+          "empty strings."
+        )
       )
       crew::crew_assert(
         private$.verbose,
@@ -250,6 +273,7 @@ crew_class_launcher_ssh <- R6::R6Class(
     .ssh_options = NULL,
     .ssh_command = NULL,
     .rscript = NULL,
+    .launch_prefix = NULL,
     .directory = NULL,
     .remote_directory = NULL,
     .verbose = NULL,
@@ -301,7 +325,12 @@ crew_class_launcher_ssh <- R6::R6Class(
         "nohup ",
         paste(
           shQuote(
-            c(private$.rscript, private$.r_arguments, script),
+            c(
+              private$.launch_prefix,
+              private$.rscript,
+              private$.r_arguments,
+              script
+            ),
             type = "sh"
           ),
           collapse = " "
@@ -505,6 +534,36 @@ crew_class_launcher_ssh <- R6::R6Class(
 #'   `ssh` tunnel along with the task. If the remote system does mount the
 #'   project directory, pass `directory` instead so workers start there and the
 #'   `targets` defaults keep working.
+#' @section Running workers in a container:
+#'   `launch_prefix` runs each worker under another command, which is how a
+#'   worker runs inside a container instead of directly on the remote system:
+#'
+#'   ```r
+#'   crew_controller_ssh(
+#'     ssh_host = "user@example.com",
+#'     launch_prefix = c(
+#'       "docker", "run", "--rm", "--network=host",
+#'       "--volume", "/tmp:/tmp", "my-image"
+#'     )
+#'   )
+#'   ```
+#'
+#'   Two details of the surrounding design decide what the prefix has to
+#'   contain.
+#'
+#'   The reverse `ssh` tunnel listens on the *remote system's* loopback
+#'   interface, and a container on a bridge network has a loopback of its own,
+#'   so a worker there would dial a port nothing is listening on. The
+#'   controller would then report a worker that launched but never connected.
+#'   The container must share the remote system's network namespace:
+#'   `--network=host` for `docker` and `podman`, which is already the default
+#'   for `apptainer`.
+#'
+#'   The launcher writes each worker's R script into `remote_directory` on the
+#'   remote system and the worker reads it back by that same path, so
+#'   `remote_directory` must be visible inside the container at the path it has
+#'   outside. Worker logs are written by the remote shell rather than by the
+#'   worker itself, so `logs()` keeps working whatever the prefix does.
 #' @return An `R6` controller object with an `ssh` launcher.
 #' @param ssh_host Character of length 1, the `ssh` destination of the remote
 #'   system, e.g. `"user@example.com"`. Anything the `ssh` command accepts
@@ -520,9 +579,16 @@ crew_class_launcher_ssh <- R6::R6Class(
 #' @param ssh_command Character of length 1, the `ssh` executable to run.
 #' @param rscript Character of length 1, path to `Rscript` on the remote
 #'   system.
+#' @param launch_prefix Character vector, a command and its arguments to run
+#'   the worker under, e.g.
+#'   `c("docker", "run", "--rm", "--network=host", "my-image")`. Empty by
+#'   default, which runs `rscript` directly. See the "Running workers in a
+#'   container" section.
 #' @param directory Character of length 1 or `NULL`, working directory of the
 #'   workers on the remote system. `NULL` means the directory `ssh` lands in,
-#'   usually the remote home directory.
+#'   usually the remote home directory. This is the directory the command named
+#'   by `launch_prefix` starts in, which for a container runtime is not the
+#'   same as the working directory inside the container.
 #' @param remote_directory Character of length 1, absolute path to a directory
 #'   on the remote system where the launcher may write worker scripts and
 #'   logs.
@@ -548,6 +614,7 @@ crew_controller_ssh <- function(
   ssh_options = character(0L),
   ssh_command = "ssh",
   rscript = "Rscript",
+  launch_prefix = character(0L),
   directory = NULL,
   remote_directory = "/tmp",
   verbose = FALSE,
@@ -590,6 +657,7 @@ crew_controller_ssh <- function(
     ssh_options = ssh_options,
     ssh_command = ssh_command,
     rscript = rscript,
+    launch_prefix = launch_prefix,
     directory = directory,
     remote_directory = remote_directory,
     verbose = verbose,
