@@ -4,3 +4,4 @@
 ^\.github$
 ^\.claude$
 ^\.git$
+^local-testing\.R$
