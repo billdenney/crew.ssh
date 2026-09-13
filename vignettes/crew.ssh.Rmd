@@ -135,6 +135,54 @@ machine. Targets with no `resources` of their own fall back to the
 `tar_option_set()` default, so the local controller stays the default and only
 the targets you mark travel.
 
+## Run workers in a container
+
+`launch_prefix` runs each worker under another command instead of starting
+`Rscript` directly, which is how a worker runs inside a container. The remote
+machine then needs only `ssh` and a container runtime, and the package versions
+a fit sees are fixed by the image rather than by whatever else is installed
+there, so other work on that machine cannot change them underneath you.
+
+```{r}
+crew_controller_ssh(
+  ssh_host = "user@example.com",
+  launch_prefix = c(
+    "docker", "run", "--rm",
+    "--network=host",
+    "--volume", "/tmp:/tmp",
+    "my-image"
+  ),
+  workers = 4L,
+  # Starting a container and attaching packages takes longer than the plain
+  # Rscript start the default allows for.
+  seconds_launch = 300
+)
+```
+
+Each element is quoted for the remote shell separately, so an element may
+contain spaces (`"--volume", "/home/my data:/data"`) without being split into
+two arguments.
+
+Two of those options are not optional.
+
+`--network=host` is required. The reverse `ssh` tunnel listens on the *remote
+machine's* loopback interface, and a container on a bridge network has a
+loopback of its own, so a worker there dials a port nothing is listening on.
+The symptom is the confusing one from "When something goes wrong" below: a
+worker that starts and then never connects. `podman` takes the same flag, and
+for `apptainer` it is already the default.
+
+`--volume /tmp:/tmp` is required because the launcher writes each worker's R
+script into `remote_directory` (`/tmp` by default) on the remote machine and the
+worker reads it back by that same path. Mount whatever you set
+`remote_directory` to, at the path it has outside the container. Worker logs are
+written by the remote shell rather than by the worker, so `logs()` keeps working
+whichever prefix you use.
+
+`directory` sets the working directory of the container runtime on the remote
+machine, not the working directory inside the container. Use the runtime's own
+option for that (`--workdir` for `docker`).
+
 ## Two settings that trip people up
 
 ### `storage` and `retrieval` must be `"main"`
