@@ -1,5 +1,13 @@
-ssh_host    <- "bill@picasso.humanpredictions.local"
-ssh_keyfile <- file.path(Sys.getenv("USERPROFILE"), ".ssh", "id_ed25519")
+# The integration tests at the end of this file need a remote host that has R
+# and crew installed and that accepts key-based SSH.  Name one in
+# CREW_SSH_TEST_HOST (for example "user@host.example.com"), optionally with a
+# key in CREW_SSH_TEST_KEYFILE; with neither set, those tests skip and the unit
+# tests below still run.
+ssh_host <- Sys.getenv("CREW_SSH_TEST_HOST", unset = "")
+ssh_keyfile <- Sys.getenv("CREW_SSH_TEST_KEYFILE", unset = "")
+if (!nzchar(ssh_keyfile)) {
+  ssh_keyfile <- NULL
+}
 
 # Unit tests (no SSH required) ----
 
@@ -197,9 +205,9 @@ test_that("crew_controller_ssh constructs and validates without error", {
   controller$terminate()
 })
 
-# Integration tests (require SSH to picasso with crew installed) ----
+# Integration tests (require a remote host with crew installed) ----
 
-can_ssh <- tryCatch({
+can_ssh <- nzchar(ssh_host) && tryCatch({
   s <- ssh::ssh_connect(ssh_host, keyfile = ssh_keyfile)
   r <- ssh::ssh_exec_internal(s, "Rscript -e 'cat(nzchar(system.file(package=\"crew\")))'")
   crew_available <- identical(trimws(rawToChar(r$stdout)), "TRUE")
@@ -207,9 +215,9 @@ can_ssh <- tryCatch({
   crew_available
 }, error = function(e) FALSE)
 
-test_that("remote task runs on picasso and returns correct hostname", {
+test_that("a remote task runs on the configured host and returns its hostname", {
   skip_on_cran()
-  skip_if(!can_ssh, "Cannot reach picasso via SSH or crew not installed on remote")
+  skip_if(!can_ssh, "Set CREW_SSH_TEST_HOST to a remote host with crew installed")
   skip_if_not_installed("ps")
   skip_if_not_installed("nanonext")
 
@@ -243,9 +251,9 @@ test_that("remote task runs on picasso and returns correct hostname", {
                label = "Worker should run on remote host, not locally")
 })
 
-test_that("multiple workers on picasso each run tasks", {
+test_that("multiple workers on the configured host each run tasks", {
   skip_on_cran()
-  skip_if(!can_ssh, "Cannot reach picasso via SSH or crew not installed on remote")
+  skip_if(!can_ssh, "Set CREW_SSH_TEST_HOST to a remote host with crew installed")
   skip_if_not_installed("ps")
   skip_if_not_installed("nanonext")
 

@@ -1,8 +1,9 @@
 library(targets)
 
 ssh_controller <- crew.ssh::crew_controller_ssh(
-  ssh_host       = "bill@picasso.humanpredictions.local",
-  ssh_keyfile    = file.path(Sys.getenv("USERPROFILE"), ".ssh", "id_ed25519"),
+  # A remote host that has R and crew installed, e.g. "user@host.example.com".
+  ssh_host       = Sys.getenv("CREW_SSH_HOST"),
+  ssh_keyfile    = Sys.getenv("CREW_SSH_KEYFILE"),
   workers        = 2L,
   seconds_idle   = 30,
   # host must be the local machine's IP as reachable from the remote server
