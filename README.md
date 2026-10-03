@@ -109,6 +109,82 @@ If the remote system *does* mount the same project directory, pass
 `directory = "/path/to/project"` so workers start there, and the `targets`
 defaults will work as usual.
 
+## Surviving a disconnect
+
+By default a remote worker exits as soon as its connection to your session
+drops, so a task in progress is lost when your laptop sleeps or your session
+dies, and it starts over the next time it runs. For long tasks, set
+`salvage = TRUE`:
+
+``` r
+controller <- crew_controller_ssh(
+  ssh_host = "user@example.com",
+  salvage = TRUE,
+  # Somewhere durable: /tmp may be cleared when the remote system restarts.
+  remote_directory = "/home/user/crew-ssh"
+)
+```
+
+With salvage, a worker whose connection drops finishes the task in progress
+and saves its result on the remote system before it exits. When the same task
+is pushed again before anything collected that result, by a later session or
+by this one retrying a task whose worker was cut off, there are two cases:
+
+* **The old worker finished.** The new worker hands back the saved result
+  instead of running the task again.
+* **The old worker is still running.** The new worker attaches to it: it waits
+  for the old worker's result and hands that back, rather than starting a
+  second copy of a task that may have hours left. `remote_workers()` shows the
+  old worker as `"running"` and the new one as `"waiting"`. If the old worker
+  dies without finishing (killed, container stopped, machine restarted), its
+  heartbeat stops, and after two minutes the new worker takes over and runs
+  the task itself.
+
+With `targets`, this means re-running `tar_make()` after a dropped connection
+picks up the remote targets that were in flight, finished or still running,
+instead of starting them over.
+
+A task is matched by its name and by everything it computes from, so a target
+whose code or data changed in between runs again. A saved error is never
+reused, and neither is a result computed under different versions of R or of
+any package. Results are written atomically, and a saved file that cannot be
+read fails the task with an error naming the file rather than being mistaken
+for a missing one.
+
+Saved results are deleted once a controller collects them. Results nothing
+collects stay on the remote system; the launcher lists and removes them, and
+lists the workers of every session, including ones that outlived their
+session:
+
+``` r
+controller$launcher$salvage_list()      # saved results and running tasks
+controller$launcher$salvage_remove(key) # delete results nothing will collect
+controller$launcher$remote_workers()    # workers of every session
+controller$launcher$terminate_orphans() # stop workers whose session is gone
+```
+
+See `?crew_controller_ssh` for the details.
+
+## Running workers in a container
+
+`launch_prefix` runs each worker under another command, such as a container
+runtime. Include `--init`:
+
+``` r
+crew_controller_ssh(
+  ssh_host = "user@example.com",
+  launch_prefix = c(
+    "docker", "run", "--init", "--rm", "--network=host",
+    "--volume", "/tmp:/tmp", "my-image"
+  )
+)
+```
+
+Without `--init`, R is the first process in the container, and Linux does not
+deliver `SIGTERM` to that process unless it handles the signal, which R does
+not. A worker then keeps running after its connection drops, computing a
+result nothing can collect. `vignette("crew.ssh")` explains the other options.
+
 ## Debugging
 
 Remote workers write their output to a log file on the remote system, one per
@@ -140,8 +216,12 @@ line for each worker launch.
    address.
 5. The tunnel process holds the write end of its own stdin pipe. When the local
    R session ends — cleanly or by being killed outright — the operating system
-   closes that pipe, the tunnel exits, and the remote workers exit with it. No
-   orphaned R processes are left behind on the remote system.
+   closes that pipe, the tunnel exits, and the remote workers exit with it, or
+   with `salvage = TRUE`, finish their current task, save it, and then exit.
+6. Each session records itself and its workers in its directory on the remote
+   system: process IDs, container IDs, and with salvage the task each worker
+   is on. A later session reads those records to find workers that outlived
+   their session and to stop them, containers included.
 
 ## Limitations
 
@@ -149,3 +229,5 @@ line for each worker launch.
 * The remote system needs a POSIX shell; Windows remotes are not supported.
 * Local and remote filesystems are assumed to be different. See the `targets`
   section above.
+* Salvage saves results with `saveRDS()`, so it cannot be combined with custom
+  `serialization`.
