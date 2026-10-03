@@ -14,6 +14,8 @@ crew_controller_ssh(
   launch_prefix = character(0L),
   directory = NULL,
   remote_directory = "/tmp",
+  salvage = FALSE,
+  salvage_directory = NULL,
   verbose = FALSE,
   name = NULL,
   workers = 1L,
@@ -62,9 +64,9 @@ system.}
 
 \item{launch_prefix}{Character vector, a command and its arguments to run
 the worker under, e.g.
-\code{c("docker", "run", "--rm", "--network=host", "my-image")}. Empty by
-default, which runs \code{rscript} directly. See the "Running workers in a
-container" section.}
+\code{c("docker", "run", "--init", "--rm", "--network=host", "my-image")}.
+Empty by default, which runs \code{rscript} directly. See the "Running
+workers in a container" section.}
 
 \item{directory}{Character of length 1 or \code{NULL}, working directory of the
 workers on the remote system. \code{NULL} means the directory \code{ssh} lands in,
@@ -73,8 +75,19 @@ by \code{launch_prefix} starts in, which for a container runtime is not the
 same as the working directory inside the container.}
 
 \item{remote_directory}{Character of length 1, absolute path to a directory
-on the remote system where the launcher may write worker scripts and
-logs.}
+on the remote system where the launcher may write worker scripts, logs,
+and records.}
+
+\item{salvage}{Logical of length 1, whether workers save the result of
+each task on the remote system so that it survives a disconnect. See the
+"Surviving a disconnect" section.}
+
+\item{salvage_directory}{Character of length 1 or \code{NULL}, absolute path to
+the directory on the remote system where workers save results, shared by
+every session. \code{NULL} means the \code{crew-ssh-salvage} subdirectory of
+\code{remote_directory}. \verb{/tmp}, the default \code{remote_directory}, may be
+cleared when the remote system restarts, so choose a durable directory
+for results that must outlast that.}
 
 \item{verbose}{Logical of length 1, whether to print messages about the
 tunnel and each worker launch.}
@@ -250,13 +263,13 @@ worker runs inside a container instead of directly on the remote system:
 \if{html}{\out{<div class="sourceCode r">}}\preformatted{crew_controller_ssh(
   ssh_host = "user@example.com",
   launch_prefix = c(
-    "docker", "run", "--rm", "--network=host",
+    "docker", "run", "--init", "--rm", "--network=host",
     "--volume", "/tmp:/tmp", "my-image"
   )
 )
 }\if{html}{\out{</div>}}
 
-Two details of the surrounding design decide what the prefix has to
+Three details of the surrounding design decide what the prefix has to
 contain.
 
 The reverse \code{ssh} tunnel listens on the \emph{remote system's} loopback
@@ -271,7 +284,76 @@ The launcher writes each worker's R script into \code{remote_directory} on the
 remote system and the worker reads it back by that same path, so
 \code{remote_directory} must be visible inside the container at the path it has
 outside. Worker logs are written by the remote shell rather than by the
-worker itself, so \code{logs()} keeps working whatever the prefix does.
+worker itself, so \code{logs()} keeps working whatever the prefix does. With
+\code{salvage = TRUE} the worker also writes its results and records there.
+
+Without \code{--init}, R is the first process of the container, and Linux
+does not deliver a signal to that process unless it installed a handler
+for it, which R does not for \code{SIGTERM}. A worker then ignores the
+signal \code{mirai} sends it when its connection drops, keeps computing a
+result nothing can collect, and outlives the session that started it.
+\code{--init} makes a small init process the first process instead, which
+passes the signal on. Use it (or an image whose entry point is an init
+process such as \code{tini}).
+
+When the prefix starts with \verb{docker run} or \verb{podman run}, the launcher
+adds \code{--cidfile} to record each container's ID and stops a worker by
+killing its container through the runtime. The process ID the launch
+reports belongs to the runtime's client, and stopping the client alone
+leaves the container running.
+}
+
+\section{Surviving a disconnect}{
+
+By default, remote workers exit as soon as their connection to the
+controller drops, so a task in progress is lost when the local session
+ends or the network goes down, and runs again from the start next time.
+With \code{salvage = TRUE}:
+\enumerate{
+\item A worker whose connection drops finishes the task in progress before
+it exits.
+\item Every worker saves the result of each task in \code{salvage_directory} on
+the remote system before handing it back, writing to a temporary file
+and renaming it, so a reader never sees a partial file. The record
+holds the value or the error, the task's key, the worker, the remote
+host, start and end times, and the versions of R and of every loaded
+package.
+\item When a later push of the same task, from this session or a later one,
+finds a saved result, the worker hands that back instead of running
+the task. It does so only for a task that succeeded and ran under the
+same versions of R and of every package the worker has installed. An
+error is never reused, and a saved file that cannot be read fails the
+task with an error that names the file.
+\item When the same task is still running on a worker of an earlier session,
+the new worker attaches to it: it waits for that worker's result
+instead of starting the task a second time, and hands the result back
+when it appears. A running worker proves it is alive by touching a
+heartbeat file every 15 seconds, even while R is busy. If a task's
+worker dies without finishing, because it was killed, its container
+was stopped, or the machine restarted, the heartbeat stops, and after
+two minutes the new worker takes over and runs the task itself. While
+this goes on, \code{remote_workers()} shows the old worker as \code{"running"}
+and the new one as \code{"waiting"}.
+}
+
+A task is identified by its name and by everything it computes from: the
+command, data, globals, seed, and packages, or for a \code{targets} target,
+its command, seed, settings, and the hashes of the data it depends on. A
+task pushed without a name, as \code{push()} allows, runs without salvage.
+Salvage assumes a task gives the same result each time it runs with the
+same inputs, which \code{targets} arranges by seeding every target.
+
+A saved result is deleted once a controller collects it with \code{pop()},
+\code{collect()}, or \code{map()}. Results nothing collects stay until the
+launcher's \code{salvage_remove()} deletes them; \code{salvage_list()} lists them.
+The launcher's \code{remote_workers()} lists the workers of every session with
+the task each is on, and \code{terminate_orphans()} stops the workers whose
+session is gone.
+
+Salvage writes every result to the remote disk, so it suits tasks that
+are slow to compute more than tasks that produce a lot of data. It
+cannot be combined with custom \code{serialization}, which the saved files
+would not apply.
 }
 
 \examples{

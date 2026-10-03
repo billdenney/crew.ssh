@@ -48,6 +48,12 @@ Other plugin_ssh:
     \item \href{#method-crew_class_launcher_ssh-settings}{\code{crew_class_launcher_ssh$settings()}}
     \item \href{#method-crew_class_launcher_ssh-launch_worker}{\code{crew_class_launcher_ssh$launch_worker()}}
     \item \href{#method-crew_class_launcher_ssh-logs}{\code{crew_class_launcher_ssh$logs()}}
+    \item \href{#method-crew_class_launcher_ssh-remote_workers}{\code{crew_class_launcher_ssh$remote_workers()}}
+    \item \href{#method-crew_class_launcher_ssh-terminate_orphans}{\code{crew_class_launcher_ssh$terminate_orphans()}}
+    \item \href{#method-crew_class_launcher_ssh-salvage_list}{\code{crew_class_launcher_ssh$salvage_list()}}
+    \item \href{#method-crew_class_launcher_ssh-salvage_remove}{\code{crew_class_launcher_ssh$salvage_remove()}}
+    \item \href{#method-crew_class_launcher_ssh-salvage_task}{\code{crew_class_launcher_ssh$salvage_task()}}
+    \item \href{#method-crew_class_launcher_ssh-salvage_collect}{\code{crew_class_launcher_ssh$salvage_collect()}}
     \item \href{#method-crew_class_launcher_ssh-terminate}{\code{crew_class_launcher_ssh$terminate()}}
   }
 }
@@ -81,6 +87,8 @@ Other plugin_ssh:
   launch_prefix = character(0L),
   directory = NULL,
   remote_directory = "/tmp",
+  salvage = FALSE,
+  salvage_directory = NULL,
   verbose = FALSE
 )}
     \if{html}{\out{</div>}}
@@ -108,10 +116,12 @@ system. The default assumes \code{Rscript} is on the remote \code{PATH} for
 non-interactive \code{ssh} sessions.}
       \item{\code{launch_prefix}}{Character vector, a command and its arguments to
 run the worker under, e.g.
-\code{c("docker", "run", "--rm", "--network=host", "my-image")}. Empty by
-default, which runs \code{rscript} directly. Each element is quoted for the
-remote shell separately, so an element may contain spaces without
-being split into two arguments.}
+\code{c("docker", "run", "--init", "--rm", "--network=host", "my-image")}.
+Empty by default, which runs \code{rscript} directly. Each element is
+quoted for the remote shell separately, so an element may contain
+spaces without being split into two arguments. When the prefix starts
+with \verb{docker run} or \verb{podman run}, the launcher adds
+\code{--cidfile} so that it can stop the container itself.}
       \item{\code{directory}}{Character of length 1 or \code{NULL}, working directory of
 the workers on the remote system. \code{NULL} means the directory \code{ssh}
 lands in, usually the remote home directory. This is the directory the
@@ -119,8 +129,17 @@ command named by \code{launch_prefix} starts in, which for a container
 runtime is not the same as the working directory inside the container.}
       \item{\code{remote_directory}}{Character of length 1, absolute path to a
 directory on the remote system where the launcher may write worker
-scripts and logs. Each controller gets its own uniquely named
-subdirectory of \code{remote_directory}.}
+scripts, logs, and records. Each controller gets its own uniquely
+named subdirectory of \code{remote_directory}.}
+      \item{\code{salvage}}{Logical of length 1, whether workers save the result of
+each task on the remote system so that it survives a disconnect. See
+the "Surviving a disconnect" section of \code{\link[=crew_controller_ssh]{crew_controller_ssh()}}.}
+      \item{\code{salvage_directory}}{Character of length 1 or \code{NULL}, absolute path
+to the directory on the remote system where workers save results.
+\code{NULL} means the \code{crew-ssh-salvage} subdirectory of
+\code{remote_directory}. Unlike the session directories, it is shared by
+every session, which is how a later session finds the results of an
+earlier one.}
       \item{\code{verbose}}{Logical of length 1, whether to print messages about the
 tunnel and each worker launch.}
     }
@@ -184,7 +203,9 @@ remote workers use to reach the local \code{mirai} dispatcher.
   \subsection{Details}{
     Identical to the settings of the parent class except that the
 URL points at the remote end of the reverse \code{ssh} tunnel instead of
-the dispatcher's local address.
+the dispatcher's local address, and that with \code{salvage = TRUE} a
+worker that loses its connection finishes the task in progress
+before it exits.
   }
   \subsection{Returns}{
     A named list of \code{mirai} daemon settings.
@@ -210,8 +231,9 @@ the dispatcher's local address.
   }
   \subsection{Returns}{
     A handle: a named list with the worker \code{name}, the remote
-process ID \code{pid}, and the remote paths of the worker \code{script} and
-\code{log}.
+process ID \code{pid}, and the remote paths of the worker \code{script}, its
+\code{log}, and the \code{container} ID file, which is \code{NULL} unless the worker
+runs under \verb{docker run} or \verb{podman run}.
   }
 }
 
@@ -248,15 +270,209 @@ started any workers.
 }
 
 \if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-remote_workers"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-remote_workers}{}}}
+\subsection{\code{crew_class_launcher_ssh$remote_workers()}}{
+  List the workers of every session under
+\code{remote_directory}, including sessions that ended or lost their
+connection.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$remote_workers()}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    This reads the records each session keeps in its directory on
+the remote system, so it finds workers that outlived the session that
+launched them: with \code{salvage = TRUE}, a worker whose connection drops
+finishes its task before it exits, and so does a container started
+without \code{--init}, salvage or not.
+  }
+  \subsection{Returns}{
+    A data frame with one row per worker: the \code{host}, the
+\code{session} and its \code{session_directory}, the \code{worker} name, the remote
+process ID \code{pid} (the client of the container runtime for a container
+worker), the \code{container} ID and \code{runtime}, whether the worker is
+\code{alive}, whether its session is still connected (\code{session_alive}),
+whether the session is this launcher's (\code{current}), and, with
+\code{salvage = TRUE}, the key, name, and state of its latest task with the
+times it started, ended, and was last updated. \code{task_state} is one of
+\code{"running"}, \code{"waiting"} (for a worker of another session running the
+same task), \code{"reused"}, \code{"success"}, \code{"error"}, or \code{"interrupted"}
+(canceled or timed out).
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-terminate_orphans"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-terminate_orphans}{}}}
+\subsection{\code{crew_class_launcher_ssh$terminate_orphans()}}{
+  Stop the workers of other sessions that are still running
+after their session ended or lost its connection.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$terminate_orphans()}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    An orphaned worker is often still busy with a task. With
+\code{salvage = TRUE} it saves the result when it finishes, and a later
+push of the same task picks it up, so stopping it throws that work
+away. Check \code{remote_workers()} first.
+  }
+  \subsection{Returns}{
+    A data frame of the workers it stopped, in the format of
+\code{remote_workers()}, invisibly.
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-salvage_list"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-salvage_list}{}}}
+\subsection{\code{crew_class_launcher_ssh$salvage_list()}}{
+  List the results saved in the salvage directory and the
+tasks running under a lock there.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$salvage_list()}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Returns}{
+    A data frame with one row per saved result or lock: the task
+\code{key}; its \code{state}, which is \code{"saved"} for a result, \code{"running"} for
+a task a live worker holds the lock of, and \code{"abandoned"} for a lock
+whose worker died; the size in \code{bytes} of a result; when it was last
+\code{modified}; the seconds since a lock's last heartbeat
+(\code{heartbeat_age}); the \code{worker} and \code{session} holding a lock; and the
+remote \code{path}.
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-salvage_remove"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-salvage_remove}{}}}
+\subsection{\code{crew_class_launcher_ssh$salvage_remove()}}{
+  Delete saved results from the salvage directory.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$salvage_remove(keys)}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Arguments}{
+    \if{html}{\out{<div class="arguments">}}
+    \describe{
+      \item{\code{keys}}{Character vector of task keys, as in the \code{key} column of
+\code{salvage_list()}.}
+    }
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    Results are deleted on their own once a controller collects
+them. Use this for results nothing will collect, such as those of a
+task whose code has changed since, which no longer match any task.
+  }
+  \subsection{Returns}{
+    \code{keys}, invisibly.
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-salvage_task"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-salvage_task}{}}}
+\subsection{\code{crew_class_launcher_ssh$salvage_task()}}{
+  Prepare a task for salvage. The controller calls this for
+every task it pushes; it is not meant to be called directly.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$salvage_task(
+  command,
+  data,
+  globals,
+  seed,
+  algorithm,
+  packages,
+  library,
+  name
+)}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Arguments}{
+    \if{html}{\out{<div class="arguments">}}
+    \describe{
+      \item{\code{command}}{Language object, the command of the task.}
+      \item{\code{data}}{Named list, the data of the task.}
+      \item{\code{globals}}{Named list, the globals of the task.}
+      \item{\code{seed, algorithm, packages, library}}{Arguments of the task as given
+to \code{push()}.}
+      \item{\code{name}}{Character of length 1 or \code{NULL}, the name of the task.}
+    }
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    Wraps the command of a named task so the worker saves its
+result on the remote system, or reuses the result a worker saved
+before. A task with no name has no identity that a later push could
+match, so it runs unchanged, as does every task with
+\code{salvage = FALSE}.
+  }
+  \subsection{Returns}{
+    A list with the \code{command} and \code{data} to push.
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-salvage_collect"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-salvage_collect}{}}}
+\subsection{\code{crew_class_launcher_ssh$salvage_collect()}}{
+  Note that the controller collected a task. The controller
+calls this for every task it hands back; it is not meant to be called
+directly.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$salvage_collect(name, status, error = NA_character_)}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Arguments}{
+    \if{html}{\out{<div class="arguments">}}
+    \describe{
+      \item{\code{name}}{Character of length 1, the name of the task.}
+      \item{\code{status}}{Character of length 1, the status \code{crew} reports for the
+task.}
+      \item{\code{error}}{Character of length 1, the error message \code{crew} reports
+for the task, or \code{NA}.}
+    }
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    A task that was collected with its result or an error from
+its own code has nothing left to salvage, so its saved result is
+deleted from the remote system, in the background and in batches. A
+task that crashed keeps its saved result: its worker may still be
+finishing it. So does a task \code{crew} reports as an error without an
+error message, which is how \code{crew} hands back a task that has not
+resolved yet.
+  }
+  \subsection{Returns}{
+    \code{NULL} (invisibly).
+  }
+}
+
+\if{html}{\out{<hr>}}
 \if{html}{\out{<a id="method-crew_class_launcher_ssh-terminate"></a>}}
 \if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-terminate}{}}}
 \subsection{\code{crew_class_launcher_ssh$terminate()}}{
-  Terminate the launcher: stop remote workers and close the
-reverse \code{ssh} tunnel.
+  Terminate the launcher: stop remote workers, delete the
+saved results this session collected, and close the reverse \code{ssh}
+tunnel.
   \subsection{Usage}{
     \if{html}{\out{<div class="r">}}
     \preformatted{crew_class_launcher_ssh$terminate()}
     \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    Termination stops workers mid-task, including with
+\code{salvage = TRUE}: a disconnect lets a worker finish and save its task,
+but terminating the controller is a request to stop.
   }
   \subsection{Returns}{
     \code{NULL} (invisibly).
