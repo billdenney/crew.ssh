@@ -14,7 +14,7 @@ crew_controller_ssh(
   launch_prefix = character(0L),
   directory = NULL,
   remote_directory = "/tmp",
-  salvage = FALSE,
+  salvage = TRUE,
   salvage_directory = NULL,
   verbose = FALSE,
   name = NULL,
@@ -79,8 +79,9 @@ on the remote system where the launcher may write worker scripts, logs,
 and records.}
 
 \item{salvage}{Logical of length 1, whether workers save the result of
-each task on the remote system so that it survives a disconnect. See the
-"Surviving a disconnect" section.}
+each task on the remote system so that it survives a disconnect. \code{TRUE}
+by default; \code{FALSE} makes workers exit as soon as their connection drops
+and saves nothing. See the "Surviving a disconnect" section.}
 
 \item{salvage_directory}{Character of length 1 or \code{NULL}, absolute path to
 the directory on the remote system where workers save results, shared by
@@ -305,10 +306,10 @@ leaves the container running.
 
 \section{Surviving a disconnect}{
 
-By default, remote workers exit as soon as their connection to the
+Without salvage, remote workers exit as soon as their connection to the
 controller drops, so a task in progress is lost when the local session
 ends or the network goes down, and runs again from the start next time.
-With \code{salvage = TRUE}:
+With \code{salvage = TRUE}, the default:
 \enumerate{
 \item A worker whose connection drops finishes the task in progress before
 it exits.
@@ -350,10 +351,11 @@ The launcher's \code{remote_workers()} lists the workers of every session with
 the task each is on, and \code{terminate_orphans()} stops the workers whose
 session is gone.
 
-Salvage writes every result to the remote disk, so it suits tasks that
-are slow to compute more than tasks that produce a lot of data. It
-cannot be combined with custom \code{serialization}, which the saved files
-would not apply.
+Salvage writes every result to the remote disk until it is collected,
+so it suits tasks that are slow to compute more than tasks that produce
+a lot of data; \code{salvage = FALSE} turns it off. It cannot be combined
+with custom \code{serialization}, which the saved files would not apply, so
+a controller with \code{serialization} needs \code{salvage = FALSE}.
 }
 
 \examples{

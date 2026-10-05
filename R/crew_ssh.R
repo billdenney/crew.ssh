@@ -69,8 +69,9 @@ crew_class_launcher_ssh <- R6::R6Class(
     #'   scripts, logs, and records. Each controller gets its own uniquely
     #'   named subdirectory of `remote_directory`.
     #' @param salvage Logical of length 1, whether workers save the result of
-    #'   each task on the remote system so that it survives a disconnect. See
-    #'   the "Surviving a disconnect" section of [crew_controller_ssh()].
+    #'   each task on the remote system so that it survives a disconnect.
+    #'   `TRUE` by default. See the "Surviving a disconnect" section of
+    #'   [crew_controller_ssh()].
     #' @param salvage_directory Character of length 1 or `NULL`, absolute path
     #'   to the directory on the remote system where workers save results.
     #'   `NULL` means the `crew-ssh-salvage` subdirectory of
@@ -90,7 +91,7 @@ crew_class_launcher_ssh <- R6::R6Class(
       launch_prefix = character(0L),
       directory = NULL,
       remote_directory = "/tmp",
-      salvage = FALSE,
+      salvage = TRUE,
       salvage_directory = NULL,
       verbose = FALSE
     ) {
@@ -1142,10 +1143,10 @@ crew_class_controller_ssh <- R6::R6Class(
 #'   reports belongs to the runtime's client, and stopping the client alone
 #'   leaves the container running.
 #' @section Surviving a disconnect:
-#'   By default, remote workers exit as soon as their connection to the
+#'   Without salvage, remote workers exit as soon as their connection to the
 #'   controller drops, so a task in progress is lost when the local session
 #'   ends or the network goes down, and runs again from the start next time.
-#'   With `salvage = TRUE`:
+#'   With `salvage = TRUE`, the default:
 #'
 #'   1. A worker whose connection drops finishes the task in progress before
 #'      it exits.
@@ -1186,10 +1187,11 @@ crew_class_controller_ssh <- R6::R6Class(
 #'   the task each is on, and `terminate_orphans()` stops the workers whose
 #'   session is gone.
 #'
-#'   Salvage writes every result to the remote disk, so it suits tasks that
-#'   are slow to compute more than tasks that produce a lot of data. It
-#'   cannot be combined with custom `serialization`, which the saved files
-#'   would not apply.
+#'   Salvage writes every result to the remote disk until it is collected,
+#'   so it suits tasks that are slow to compute more than tasks that produce
+#'   a lot of data; `salvage = FALSE` turns it off. It cannot be combined
+#'   with custom `serialization`, which the saved files would not apply, so
+#'   a controller with `serialization` needs `salvage = FALSE`.
 #' @return An `R6` controller object with an `ssh` launcher.
 #' @param ssh_host Character of length 1, the `ssh` destination of the remote
 #'   system, e.g. `"user@example.com"`. Anything the `ssh` command accepts
@@ -1219,8 +1221,9 @@ crew_class_controller_ssh <- R6::R6Class(
 #'   on the remote system where the launcher may write worker scripts, logs,
 #'   and records.
 #' @param salvage Logical of length 1, whether workers save the result of
-#'   each task on the remote system so that it survives a disconnect. See the
-#'   "Surviving a disconnect" section.
+#'   each task on the remote system so that it survives a disconnect. `TRUE`
+#'   by default; `FALSE` makes workers exit as soon as their connection drops
+#'   and saves nothing. See the "Surviving a disconnect" section.
 #' @param salvage_directory Character of length 1 or `NULL`, absolute path to
 #'   the directory on the remote system where workers save results, shared by
 #'   every session. `NULL` means the `crew-ssh-salvage` subdirectory of
@@ -1252,7 +1255,7 @@ crew_controller_ssh <- function(
   launch_prefix = character(0L),
   directory = NULL,
   remote_directory = "/tmp",
-  salvage = FALSE,
+  salvage = TRUE,
   salvage_directory = NULL,
   verbose = FALSE,
   name = NULL,
@@ -1281,9 +1284,10 @@ crew_controller_ssh <- function(
   crew::crew_assert(
     !(isTRUE(salvage) && !is.null(serialization)),
     message = paste(
-      "salvage = TRUE cannot be combined with custom serialization: workers",
-      "save results with saveRDS(), which would not apply it, and a value",
-      "read back would be broken."
+      "salvage = TRUE (the default) cannot be combined with custom",
+      "serialization: workers save results with saveRDS(), which would not",
+      "apply it, and a value read back would be broken. Set salvage = FALSE",
+      "to use serialization."
     )
   )
   client <- crew::crew_client(

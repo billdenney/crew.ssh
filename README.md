@@ -111,16 +111,18 @@ defaults will work as usual.
 
 ## Surviving a disconnect
 
-By default a remote worker exits as soon as its connection to your session
-drops, so a task in progress is lost when your laptop sleeps or your session
-dies, and it starts over the next time it runs. For long tasks, set
-`salvage = TRUE`:
+Without salvage, a remote worker exits as soon as its connection to your
+session drops, so a task in progress is lost when your laptop sleeps or your
+session dies, and it starts over the next time it runs. Salvage is on by
+default (`salvage = TRUE`), so that does not happen. Choose where results are
+saved, and turn it off with `salvage = FALSE` for tasks that are quick to
+compute and large to store:
 
 ``` r
 controller <- crew_controller_ssh(
   ssh_host = "user@example.com",
-  salvage = TRUE,
-  # Somewhere durable: /tmp may be cleared when the remote system restarts.
+  # Somewhere durable: /tmp, the default, may be cleared when the remote
+  # system restarts.
   remote_directory = "/home/user/crew-ssh"
 )
 ```
@@ -216,11 +218,11 @@ line for each worker launch.
    address.
 5. The tunnel process holds the write end of its own stdin pipe. When the local
    R session ends — cleanly or by being killed outright — the operating system
-   closes that pipe, the tunnel exits, and the remote workers exit with it, or
-   with `salvage = TRUE`, finish their current task, save it, and then exit.
+   closes that pipe, the tunnel exits, and the remote workers exit with it,
+   after they finish their current task and save it (or at once, with
+   `salvage = FALSE`).
 6. Each session records itself and its workers in its directory on the remote
-   system: process IDs, container IDs, and with salvage the task each worker
-   is on. A later session reads those records to find workers that outlived
+   system: process IDs, container IDs, and the task each worker is on. A later session reads those records to find workers that outlived
    their session and to stop them, containers included.
 
 ## Limitations
@@ -229,5 +231,5 @@ line for each worker launch.
 * The remote system needs a POSIX shell; Windows remotes are not supported.
 * Local and remote filesystems are assumed to be different. See the `targets`
   section above.
-* Salvage saves results with `saveRDS()`, so it cannot be combined with custom
-  `serialization`.
+* Salvage saves results with `saveRDS()`, so a controller with custom
+  `serialization` needs `salvage = FALSE`.

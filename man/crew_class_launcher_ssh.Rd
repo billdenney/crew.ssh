@@ -87,7 +87,7 @@ Other plugin_ssh:
   launch_prefix = character(0L),
   directory = NULL,
   remote_directory = "/tmp",
-  salvage = FALSE,
+  salvage = TRUE,
   salvage_directory = NULL,
   verbose = FALSE
 )}
@@ -132,8 +132,9 @@ directory on the remote system where the launcher may write worker
 scripts, logs, and records. Each controller gets its own uniquely
 named subdirectory of \code{remote_directory}.}
       \item{\code{salvage}}{Logical of length 1, whether workers save the result of
-each task on the remote system so that it survives a disconnect. See
-the "Surviving a disconnect" section of \code{\link[=crew_controller_ssh]{crew_controller_ssh()}}.}
+each task on the remote system so that it survives a disconnect.
+\code{TRUE} by default. See the "Surviving a disconnect" section of
+\code{\link[=crew_controller_ssh]{crew_controller_ssh()}}.}
       \item{\code{salvage_directory}}{Character of length 1 or \code{NULL}, absolute path
 to the directory on the remote system where workers save results.
 \code{NULL} means the \code{crew-ssh-salvage} subdirectory of

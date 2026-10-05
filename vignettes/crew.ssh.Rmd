@@ -288,14 +288,15 @@ When it exits, so does the pipeline. Finished work is never lost: `targets`
 commits each target to the store as it completes, so re-running `tar_make()`
 skips everything that finished.
 
-What happens to the targets that were *in flight* depends on `salvage`.
+What happens to the targets that were *in flight* depends on `salvage`, which
+is `TRUE` by default.
 
 ### Without salvage: in-flight targets start over
 
-By default, a remote worker exits as soon as its connection drops, so a closed
-laptop does not leave stray R processes computing on a shared server. The
-targets those workers were running are lost, and the next `tar_make()` runs
-them again from the start:
+With `salvage = FALSE`, a remote worker exits as soon as its connection drops,
+so a closed laptop does not leave stray R processes computing on a shared
+server. The targets those workers were running are lost, and the next
+`tar_make()` runs them again from the start:
 
 ```{r}
 # Session dies after 5 of 8 branches.
@@ -308,9 +309,10 @@ tar_make()
 
 ### With salvage: in-flight targets are picked up
 
-For targets that take hours, losing the work in progress costs hours. Set
-`salvage = TRUE` and a worker whose connection drops finishes its target and
-saves the result on the remote machine before it exits:
+For targets that take hours, losing the work in progress costs hours. With
+salvage, a worker whose connection drops finishes its target and saves the
+result on the remote machine before it exits. All it needs from you is a
+durable place to save:
 
 ```{r}
 tar_option_set(
@@ -318,7 +320,6 @@ tar_option_set(
   retrieval = "main",
   controller = crew.ssh::crew_controller_ssh(
     ssh_host = "user@example.com",
-    salvage = TRUE,
     remote_directory = "/home/me/crew-ssh"
   )
 )
@@ -412,7 +413,7 @@ the pipeline needs to live:
 | You want | Where the pipeline runs | Controller |
 |---|---|---|
 | Interactive work, heavy compute elsewhere | Your machine | `crew_controller_ssh()` |
-| The same, without losing in-flight targets to a dropped connection | Your machine | `crew_controller_ssh(salvage = TRUE)` |
+| The same, quick targets with large results, nothing saved on the remote machine | Your machine | `crew_controller_ssh(salvage = FALSE)` |
 | A run that keeps going while you are logged off | The remote machine | `crew_controller_local()`, started under `nohup` or `tmux` |
 
 Brief network interruptions are survivable in the first arrangement: the
@@ -420,6 +421,11 @@ tunnel tolerates roughly 90 seconds of silence, and `crew.ssh` reopens it if it
 does drop, so later workers reconnect without restarting the pipeline. With
 salvage, the workers that were cut off finish and save their targets, and the
 retries of those targets pick the results up.
+
+Salvage keeps each result on the remote machine until a session collects it,
+so with `salvage = FALSE` for targets that return a lot of data and compute
+quickly, nothing is written there. A controller with custom `serialization`
+needs `salvage = FALSE`, because saved results would not apply it.
 
 ## How it works
 
@@ -433,8 +439,8 @@ retries of those targets pick the results up.
 4. Workers dial the remote end of the tunnel instead of your machine's address.
 5. The tunnel process holds the write end of its own standard input. When your
    R session ends, however abruptly, the operating system closes that pipe and
-   the tunnel exits, which shuts the remote workers down with it, or with
-   `salvage = TRUE` lets them finish and save their current target first.
+   the tunnel exits, which shuts the remote workers down with it, after they
+   finish and save their current target (or at once, with `salvage = FALSE`).
 6. Each session records its workers in its directory on the remote machine,
    which is how a later session finds them.
 

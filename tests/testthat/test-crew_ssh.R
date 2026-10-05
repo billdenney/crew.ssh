@@ -367,8 +367,41 @@ test_that("the salvage arguments are validated", {
       salvage = TRUE,
       serialization = mirai::serial_config("custom", identity, identity)
     ),
-    "salvage = TRUE cannot be combined with custom serialization",
+    "cannot be combined with custom serialization",
     class = "crew_error"
+  )
+})
+
+test_that("salvage is on unless it is turned off", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com"
+  )$launcher$.__enclos_env__$private
+  expect_true(private$.salvage)
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    salvage = FALSE
+  )$launcher$.__enclos_env__$private
+  expect_false(private$.salvage)
+})
+
+test_that("custom serialization needs salvage = FALSE, and says so", {
+  serialization <- mirai::serial_config("custom", identity, identity)
+  expect_error(
+    crew_controller_ssh(
+      ssh_host = "user@example.com",
+      serialization = serialization
+    ),
+    "Set salvage = FALSE to use serialization.",
+    fixed = TRUE,
+    class = "crew_error"
+  )
+  expect_s3_class(
+    crew_controller_ssh(
+      ssh_host = "user@example.com",
+      serialization = serialization,
+      salvage = FALSE
+    ),
+    "crew_class_controller_ssh"
   )
 })
 
@@ -393,7 +426,8 @@ test_that("the tunnel command records the session and then waits on stdin", {
   private <- crew_controller_ssh(
     ssh_host = "user@example.com",
     name = "ctl",
-    launch_prefix = c("docker", "run", "img")
+    launch_prefix = c("docker", "run", "img"),
+    salvage = FALSE
   )$launcher$.__enclos_env__$private
   private$.session <- "crew-ssh-abc"
   private$.session_directory <- "/tmp/crew-ssh-abc"
@@ -418,7 +452,10 @@ test_that("the tunnel command records the session and then waits on stdin", {
 })
 
 test_that("salvage_task() leaves a task alone without salvage or a name", {
-  launcher <- crew_controller_ssh(ssh_host = "user@example.com")$launcher
+  launcher <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    salvage = FALSE
+  )$launcher
   task <- launcher$salvage_task(
     command = quote(f(x)),
     data = list(x = 1),
@@ -480,7 +517,10 @@ test_that("salvage_task() leaves a task alone without salvage or a name", {
 })
 
 # A launcher with salvage whose session is set up without opening a tunnel.
+# The remote system's paths are POSIX paths, which a Windows temporary
+# directory is not, and Windows cannot be the remote system.
 salvage_launcher <- function(remote_directory = remote_tempdir()) {
+  skip_on_os("windows")
   launcher <- crew_controller_ssh(
     ssh_host = "fakehost",
     ssh_command = fake_ssh(),
@@ -704,7 +744,7 @@ test_that("a session records itself and its tunnel on the remote system", {
 
 test_that("without salvage, workers keep crew's exit-at-once setting", {
   skip_without_fake_ssh()
-  controller <- fake_controller(remote_tempdir())
+  controller <- fake_controller(remote_tempdir(), salvage = FALSE)
   on.exit(controller$terminate())
   controller$start()
   expect_identical(
