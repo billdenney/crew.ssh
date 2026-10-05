@@ -14,11 +14,12 @@ run_sh <- function(script) {
 }
 
 # A process whose command line names the session, as a worker's or a tunnel's
-# does.
+# does. The trailing ":" matters: a shell given one command, as macOS's bash
+# is, replaces itself with it and the name is gone from the command line.
 process_naming <- function(session, seconds = 60) {
   processx::process$new(
     "sh",
-    c("-c", paste("sleep", seconds), session),
+    c("-c", paste("sleep", seconds, "; :"), session),
     cleanup = TRUE
   )
 }
