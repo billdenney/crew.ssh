@@ -53,10 +53,12 @@ crew_class_launcher_ssh <- R6::R6Class(
     #'   non-interactive `ssh` sessions.
     #' @param launch_prefix Character vector, a command and its arguments to
     #'   run the worker under, e.g.
-    #'   `c("docker", "run", "--rm", "--network=host", "my-image")`. Empty by
-    #'   default, which runs `rscript` directly. Each element is quoted for the
-    #'   remote shell separately, so an element may contain spaces without
-    #'   being split into two arguments.
+    #'   `c("docker", "run", "--init", "--rm", "--network=host", "my-image")`.
+    #'   Empty by default, which runs `rscript` directly. Each element is
+    #'   quoted for the remote shell separately, so an element may contain
+    #'   spaces without being split into two arguments. When the prefix starts
+    #'   with `docker run` or `podman run`, the launcher adds
+    #'   `--cidfile` so that it can stop the container itself.
     #' @param directory Character of length 1 or `NULL`, working directory of
     #'   the workers on the remote system. `NULL` means the directory `ssh`
     #'   lands in, usually the remote home directory. This is the directory the
@@ -64,8 +66,18 @@ crew_class_launcher_ssh <- R6::R6Class(
     #'   runtime is not the same as the working directory inside the container.
     #' @param remote_directory Character of length 1, absolute path to a
     #'   directory on the remote system where the launcher may write worker
-    #'   scripts and logs. Each controller gets its own uniquely named
-    #'   subdirectory of `remote_directory`.
+    #'   scripts, logs, and records. Each controller gets its own uniquely
+    #'   named subdirectory of `remote_directory`.
+    #' @param salvage Logical of length 1, whether workers save the result of
+    #'   each task on the remote system so that it survives a disconnect.
+    #'   `TRUE` by default. See the "Surviving a disconnect" section of
+    #'   [crew_controller_ssh()].
+    #' @param salvage_directory Character of length 1 or `NULL`, absolute path
+    #'   to the directory on the remote system where workers save results.
+    #'   `NULL` means the `crew-ssh-salvage` subdirectory of
+    #'   `remote_directory`. Unlike the session directories, it is shared by
+    #'   every session, which is how a later session finds the results of an
+    #'   earlier one.
     #' @param verbose Logical of length 1, whether to print messages about the
     #'   tunnel and each worker launch.
     initialize = function(
@@ -79,6 +91,8 @@ crew_class_launcher_ssh <- R6::R6Class(
       launch_prefix = character(0L),
       directory = NULL,
       remote_directory = "/tmp",
+      salvage = TRUE,
+      salvage_directory = NULL,
       verbose = FALSE
     ) {
       super$initialize(...)
@@ -91,6 +105,8 @@ crew_class_launcher_ssh <- R6::R6Class(
       private$.launch_prefix <- launch_prefix
       private$.directory <- directory
       private$.remote_directory <- remote_directory
+      private$.salvage <- salvage
+      private$.salvage_directory <- salvage_directory
       private$.verbose <- verbose
     },
     #' @description Validate the launcher.
@@ -155,6 +171,29 @@ crew_class_launcher_ssh <- R6::R6Class(
         )
       )
       crew::crew_assert(
+        is.null(private$container_runtime()) ||
+          !any(grepl("^--cidfile(=|$)", private$.launch_prefix)),
+        message = paste(
+          "launch_prefix must not set --cidfile: crew.ssh sets it itself to",
+          "record the container ID of each worker."
+        )
+      )
+      crew::crew_assert(
+        private$.salvage,
+        isTRUE(.) || isFALSE(.),
+        message = "salvage must be TRUE or FALSE."
+      )
+      crew::crew_assert(
+        private$.salvage_directory,
+        is.null(.) ||
+          (is.character(.) && length(.) == 1L && !anyNA(.) &&
+             substr(., 1L, 1L) == "/"),
+        message = paste(
+          "salvage_directory must be NULL or an absolute path on the remote",
+          "system."
+        )
+      )
+      crew::crew_assert(
         private$.verbose,
         isTRUE(.) || isFALSE(.),
         message = "verbose must be TRUE or FALSE."
@@ -175,40 +214,63 @@ crew_class_launcher_ssh <- R6::R6Class(
         private$.session
       )
       private$.handles <- list()
+      # Hashed environments, because a pipeline may push and collect hundreds
+      # of thousands of tasks, and growing a vector costs a copy each time.
+      private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
+      private$.salvage_collected <- new.env(hash = TRUE, parent = emptyenv())
+      private$.salvage_shipped <- salvage_shipped(
+        directory = private$salvage_root(),
+        session = private$.session,
+        session_directory = private$.session_directory,
+        controller = private$.name,
+        seconds = private$.salvage_seconds
+      )
       private$tunnel_start()
       invisible()
     },
     #' @description `mirai` daemon settings for a remote worker.
     #' @details Identical to the settings of the parent class except that the
     #'   URL points at the remote end of the reverse `ssh` tunnel instead of
-    #'   the dispatcher's local address.
+    #'   the dispatcher's local address, and that with `salvage = TRUE` a
+    #'   worker that loses its connection finishes the task in progress
+    #'   before it exits.
     #' @return A named list of `mirai` daemon settings.
     settings = function() {
       out <- super$settings()
       if (!is.null(private$.tunnel_port)) {
         out$url <- private$worker_url()
       }
+      # mirai reads autoexit = NA as "complete the task in progress, then
+      # exit" and the crew default, a signal, as "exit now". Exiting now would
+      # throw away the work salvage exists to keep.
+      if (isTRUE(private$.salvage)) {
+        out$autoexit <- NA
+      }
       out
     },
     #' @description Launch a worker on the remote system.
     #' @return A handle: a named list with the worker `name`, the remote
-    #'   process ID `pid`, and the remote paths of the worker `script` and
-    #'   `log`.
+    #'   process ID `pid`, and the remote paths of the worker `script`, its
+    #'   `log`, and the `container` ID file, which is `NULL` unless the worker
+    #'   runs under `docker run` or `podman run`.
     #' @param call Character of length 1, R code the worker should run.
     launch_worker = function(call) {
       private$tunnel_check()
       name <- paste0("worker-", crew::crew_random_name())
-      script <- paste0(private$.session_directory, "/", name, ".R")
-      log <- paste0(private$.session_directory, "/", name, ".log")
+      paths <- private$worker_paths(name)
       # The worker code travels over the ssh session's stdin instead of the
       # command line so that no amount of quoting in the deparsed call can
-      # confuse the remote shell.
+      # confuse the remote shell. The variable tells the worker its name,
+      # which the salvage records use, and marks it as a crew.ssh worker.
       local_script <- tempfile(pattern = "crew_ssh_", fileext = ".R")
       on.exit(unlink(local_script), add = TRUE)
-      writeLines(call, con = local_script)
-      command <- private$worker_command(script = script, log = log)
+      writeLines(
+        c(sprintf("Sys.setenv(CREW_SSH_WORKER = %s)", deparse(name)), call),
+        con = local_script
+      )
+      command <- private$worker_command(name)
       if (private$.verbose) {
-        message("crew.ssh: launching ", name, ", log at ", log)
+        message("crew.ssh: launching ", name, ", log at ", paths$log)
       }
       out <- private$run(
         command = command,
@@ -228,7 +290,17 @@ crew_class_launcher_ssh <- R6::R6Class(
           )
         )
       }
-      handle <- list(name = name, pid = pid, script = script, log = log)
+      handle <- list(
+        name = name,
+        pid = pid,
+        script = paths$script,
+        log = paths$log,
+        container = if (is.null(private$container_runtime())) {
+          NULL
+        } else {
+          paths$cid
+        }
+      )
       private$.handles[[name]] <- handle
       handle
     },
@@ -256,11 +328,256 @@ crew_class_launcher_ssh <- R6::R6Class(
       )
       strsplit(paste0(out$stdout, out$stderr), split = "\n", fixed = TRUE)[[1L]]
     },
-    #' @description Terminate the launcher: stop remote workers and close the
-    #'   reverse `ssh` tunnel.
+    #' @description List the workers of every session under
+    #'   `remote_directory`, including sessions that ended or lost their
+    #'   connection.
+    #' @details This reads the records each session keeps in its directory on
+    #'   the remote system, so it finds workers that outlived the session that
+    #'   launched them: with `salvage = TRUE`, a worker whose connection drops
+    #'   finishes its task before it exits, and so does a container started
+    #'   without `--init`, salvage or not.
+    #' @return A data frame with one row per worker: the `host`, the
+    #'   `session` and its `session_directory`, the `worker` name, the remote
+    #'   process ID `pid` (the client of the container runtime for a container
+    #'   worker), the `container` ID and `runtime`, whether the worker is
+    #'   `alive`, whether its session is still connected (`session_alive`),
+    #'   whether the session is this launcher's (`current`), and, with
+    #'   `salvage = TRUE`, the key, name, and state of its latest task with the
+    #'   times it started, ended, and was last updated. `task_state` is one of
+    #'   `"running"`, `"waiting"` (for a worker of another session running the
+    #'   same task), `"reused"`, `"success"`, `"error"`, or `"interrupted"`
+    #'   (canceled or timed out).
+    remote_workers = function() {
+      out <- private$run(
+        command = remote_workers_script(private$.remote_directory),
+        timeout = private$.seconds_timeout
+      )
+      private$assert_remote(out, "list the remote workers")
+      remote_workers_frame(
+        text = out$stdout,
+        host = private$.ssh_host,
+        remote_directory = private$.remote_directory,
+        session = private$.session
+      )
+    },
+    #' @description Stop the workers of other sessions that are still running
+    #'   after their session ended or lost its connection.
+    #' @details An orphaned worker is often still busy with a task. With
+    #'   `salvage = TRUE` it saves the result when it finishes, and a later
+    #'   push of the same task picks it up, so stopping it throws that work
+    #'   away. Check `remote_workers()` first.
+    #' @return A data frame of the workers it stopped, in the format of
+    #'   `remote_workers()`, invisibly.
+    terminate_orphans = function() {
+      workers <- self$remote_workers()
+      orphans <- workers[
+        workers$alive & !workers$session_alive & !workers$current,
+        ,
+        drop = FALSE
+      ]
+      if (nrow(orphans)) {
+        out <- private$run(
+          command = remote_stop_script(
+            pids = orphans$pid,
+            sessions = orphans$session,
+            cid_files = paste0(
+              orphans$session_directory, "/", orphans$worker, ".cid"
+            ),
+            runtimes = orphans$runtime
+          ),
+          timeout = private$.seconds_timeout
+        )
+        private$assert_remote(out, "stop the orphaned workers")
+      }
+      invisible(orphans)
+    },
+    #' @description List the results saved in the salvage directory and the
+    #'   tasks running under a lock there.
+    #' @return A data frame with one row per saved result or lock: the task
+    #'   `key`; its `state`, which is `"saved"` for a result, `"running"` for
+    #'   a task a live worker holds the lock of, and `"abandoned"` for a lock
+    #'   whose worker died; the size in `bytes` of a result; when it was last
+    #'   `modified`; the seconds since a lock's last heartbeat
+    #'   (`heartbeat_age`); the `worker` and `session` holding a lock; and the
+    #'   remote `path`.
+    salvage_list = function() {
+      out <- private$run(
+        command = remote_salvage_script(private$salvage_root()),
+        timeout = private$.seconds_timeout
+      )
+      private$assert_remote(out, "list the saved results")
+      remote_salvage_frame(
+        text = out$stdout,
+        directory = private$salvage_root(),
+        seconds_stale = private$.salvage_seconds[["stale"]]
+      )
+    },
+    #' @description Delete saved results from the salvage directory.
+    #' @details Results are deleted on their own once a controller collects
+    #'   them. Use this for results nothing will collect, such as those of a
+    #'   task whose code has changed since, which no longer match any task.
+    #' @return `keys`, invisibly.
+    #' @param keys Character vector of task keys, as in the `key` column of
+    #'   `salvage_list()`.
+    salvage_remove = function(keys) {
+      crew::crew_assert(
+        keys,
+        is.character(.),
+        !anyNA(.),
+        all(grepl("^[A-Za-z0-9._-]+$", .)),
+        message = paste(
+          "keys must be task keys as salvage_list() reports them: letters,",
+          "digits, dots, underscores, and dashes."
+        )
+      )
+      if (length(keys)) {
+        out <- private$run(
+          command = paste(
+            "rm -f --",
+            paste(
+              shQuote(private$salvage_path(keys), type = "sh"),
+              collapse = " "
+            )
+          ),
+          timeout = private$.seconds_timeout
+        )
+        private$assert_remote(out, "delete the saved results")
+      }
+      invisible(keys)
+    },
+    #' @description Prepare a task for salvage. The controller calls this for
+    #'   every task it pushes; it is not meant to be called directly.
+    #' @details Wraps the command of a named task so the worker saves its
+    #'   result on the remote system, or reuses the result a worker saved
+    #'   before. A task with no name has no identity that a later push could
+    #'   match, so it runs unchanged, as does every task with
+    #'   `salvage = FALSE`.
+    #' @return A list with the `command` and `data` to push.
+    #' @param command Language object, the command of the task.
+    #' @param data Named list, the data of the task.
+    #' @param globals Named list, the globals of the task.
+    #' @param seed,algorithm,packages,library Arguments of the task as given
+    #'   to `push()`.
+    #' @param name Character of length 1 or `NULL`, the name of the task.
+    salvage_task = function(
+      command,
+      data,
+      globals,
+      seed,
+      algorithm,
+      packages,
+      library,
+      name
+    ) {
+      if (!isTRUE(private$.salvage) || is.null(name) || !nzchar(name)) {
+        return(list(command = command, data = data))
+      }
+      crew::crew_assert(
+        !is.null(private$.salvage_shipped),
+        message = paste(
+          "the crew.ssh launcher must be started before tasks are pushed."
+        )
+      )
+      crew::crew_assert(
+        !(".crew_ssh_salvage" %in% names(data)),
+        message = "the data of a task must not contain .crew_ssh_salvage."
+      )
+      if (!identical(globals, private$.salvage_globals)) {
+        private$.salvage_globals <- globals
+        private$.salvage_globals_hash <- salvage_globals_hash(globals)
+      }
+      key <- salvage_key(
+        command = command,
+        data = data,
+        globals_hash = private$.salvage_globals_hash,
+        seed = seed,
+        algorithm = algorithm,
+        packages = packages,
+        library = library,
+        name = name
+      )
+      # A pushed task owns its key again, so a deletion still waiting from an
+      # earlier collection would delete the new result.
+      private$.salvage_pending <- setdiff(
+        private$.salvage_pending,
+        private$salvage_path(key)
+      )
+      assign(name, key, envir = private$.salvage_keys)
+      # A result this session has already collected was delivered. Running a
+      # task again after that asks for a new run, not for the same result.
+      reuse <- !exists(
+        key,
+        envir = private$.salvage_collected,
+        inherits = FALSE
+      )
+      command <- substitute(
+        .crew_ssh_salvage$run(
+          expr = quote(command),
+          envir = environment(),
+          key = key,
+          name = name,
+          reuse = reuse,
+          salvage = .crew_ssh_salvage
+        ),
+        list(command = command, key = key, name = name, reuse = reuse)
+      )
+      data <- c(data, list(.crew_ssh_salvage = private$.salvage_shipped))
+      private$salvage_flush(wait = FALSE)
+      list(command = command, data = data)
+    },
+    #' @description Note that the controller collected a task. The controller
+    #'   calls this for every task it hands back; it is not meant to be called
+    #'   directly.
+    #' @details A task that was collected with its result or an error from
+    #'   its own code has nothing left to salvage, so its saved result is
+    #'   deleted from the remote system, in the background and in batches. A
+    #'   task that crashed keeps its saved result: its worker may still be
+    #'   finishing it. So does a task `crew` reports as an error without an
+    #'   error message, which is how `crew` hands back a task that has not
+    #'   resolved yet.
+    #' @return `NULL` (invisibly).
+    #' @param name Character of length 1, the name of the task.
+    #' @param status Character of length 1, the status `crew` reports for the
+    #'   task.
+    #' @param error Character of length 1, the error message `crew` reports
+    #'   for the task, or `NA`.
+    salvage_collect = function(name, status, error = NA_character_) {
+      keys <- private$.salvage_keys
+      key <- if (is.null(keys)) {
+        NULL
+      } else {
+        get0(name, envir = keys, inherits = FALSE)
+      }
+      if (is.null(key) || identical(status, "crash")) {
+        return(invisible())
+      }
+      rm(list = name, envir = keys)
+      # A task that raised an error has one, as crew_eval() records it. An
+      # error status with none comes from crew itself, which reports a task
+      # it returned before the task resolved that way, and that task is still
+      # running.
+      delivered <- identical(status, "success") ||
+        (identical(status, "error") && !is.na(error))
+      if (delivered) {
+        assign(key, TRUE, envir = private$.salvage_collected)
+        private$.salvage_pending <- union(
+          private$.salvage_pending,
+          private$salvage_path(key)
+        )
+        private$salvage_flush(wait = FALSE)
+      }
+      invisible()
+    },
+    #' @description Terminate the launcher: stop remote workers, delete the
+    #'   saved results this session collected, and close the reverse `ssh`
+    #'   tunnel.
+    #' @details Termination stops workers mid-task, including with
+    #'   `salvage = TRUE`: a disconnect lets a worker finish and save its task,
+    #'   but terminating the controller is a request to stop.
     #' @return `NULL` (invisibly).
     terminate = function() {
       private$workers_stop()
+      private$salvage_flush(wait = TRUE)
       private$tunnel_stop()
       super$terminate()
       invisible()
@@ -276,6 +593,8 @@ crew_class_launcher_ssh <- R6::R6Class(
     .launch_prefix = NULL,
     .directory = NULL,
     .remote_directory = NULL,
+    .salvage = NULL,
+    .salvage_directory = NULL,
     .verbose = NULL,
     .session = NULL,
     .session_directory = NULL,
@@ -283,6 +602,18 @@ crew_class_launcher_ssh <- R6::R6Class(
     .tunnel = NULL,
     .tunnel_port = NULL,
     .tunnel_output = character(0L),
+    # How often a busy worker touches the heartbeat of its lock, how long a
+    # silent lock counts as held, and how often a worker waiting for another
+    # one checks back, in seconds.
+    .salvage_seconds = c(heartbeat = 15, stale = 120, poll = 10),
+    .salvage_shipped = NULL,
+    .salvage_globals = NULL,
+    .salvage_globals_hash = NULL,
+    .salvage_keys = NULL,
+    .salvage_collected = NULL,
+    .salvage_pending = character(0L),
+    .salvage_deleting = character(0L),
+    .salvage_cleanup = NULL,
     ssh_args = function() {
       c(
         private$.ssh_options,
@@ -307,16 +638,61 @@ crew_class_launcher_ssh <- R6::R6Class(
         timeout = timeout
       )
     },
+    assert_remote = function(out, task) {
+      crew::crew_assert(
+        identical(out$status, 0L),
+        message = paste0(
+          "crew.ssh could not ", task, " on ", private$.ssh_host, ". ",
+          "ssh exited with status ", out$status,
+          if (isTRUE(out$timeout)) " (timed out)" else "",
+          ".\nstderr: ", trimws(out$stderr)
+        )
+      )
+    },
+    # The container runtime the workers run under, if launch_prefix starts one
+    # this launcher knows how to stop.
+    container_runtime = function() {
+      prefix <- private$.launch_prefix
+      if (
+        length(prefix) >= 2L &&
+          basename(prefix[1L]) %in% c("docker", "podman") &&
+          identical(prefix[2L], "run")
+      ) {
+        prefix[1L]
+      } else {
+        NULL
+      }
+    },
+    # The runtime as the records spell it: empty when there is none.
+    runtime_name = function() {
+      runtime <- private$container_runtime()
+      if (is.null(runtime)) "" else runtime
+    },
+    worker_paths = function(name) {
+      base <- paste0(private$.session_directory, "/", name)
+      list(
+        script = paste0(base, ".R"),
+        log = paste0(base, ".log"),
+        pid = paste0(base, ".pid"),
+        cid = paste0(base, ".cid")
+      )
+    },
     # Shell command that receives the worker script on stdin, detaches an
-    # Rscript process to run it, and reports that process's PID. Everything
-    # that varies is quoted for the remote POSIX shell; the worker code itself
-    # never reaches the command line, so no amount of quoting in the deparsed
-    # call can confuse the shell.
-    worker_command = function(script, log) {
+    # Rscript process to run it, records that process's PID in the session
+    # directory, and reports it. Everything that varies is quoted for the
+    # remote POSIX shell; the worker code itself never reaches the command
+    # line, so no amount of quoting in the deparsed call can confuse the
+    # shell.
+    worker_command = function(name) {
+      paths <- private$worker_paths(name)
+      prefix <- private$.launch_prefix
+      if (!is.null(private$container_runtime())) {
+        prefix <- append(prefix, c("--cidfile", paths$cid), after = 2L)
+      }
       paste0(
         "set -e; ",
         "mkdir -p ", shQuote(private$.session_directory, type = "sh"), "; ",
-        "cat > ", shQuote(script, type = "sh"), "; ",
+        "cat > ", shQuote(paths$script, type = "sh"), "; ",
         if (is.null(private$.directory)) {
           ""
         } else {
@@ -325,17 +701,14 @@ crew_class_launcher_ssh <- R6::R6Class(
         "nohup ",
         paste(
           shQuote(
-            c(
-              private$.launch_prefix,
-              private$.rscript,
-              private$.r_arguments,
-              script
-            ),
+            c(prefix, private$.rscript, private$.r_arguments, paths$script),
             type = "sh"
           ),
           collapse = " "
         ),
-        " > ", shQuote(log, type = "sh"), " 2>&1 < /dev/null & echo $!"
+        " > ", shQuote(paths$log, type = "sh"), " 2>&1 < /dev/null & ",
+        "pid=$!; echo \"$pid\" > ", shQuote(paths$pid, type = "sh"), "; ",
+        "echo \"$pid\""
       )
     },
     # Split "tcp://127.0.0.1:5000" into its scheme, host, and port. The port is
@@ -364,6 +737,40 @@ crew_class_launcher_ssh <- R6::R6Class(
       parsed <- private$parse_url(private$.url)
       paste0(parsed$scheme, "://127.0.0.1:", private$.tunnel_port)
     },
+    # What the tunnel's ssh session runs on the remote system. It writes the
+    # session's records, reports that it is ready, and then waits on stdin,
+    # under a command line that names the session so that tunnel.pid can be
+    # checked against it. The trailing ":" keeps sh from replacing itself
+    # with cat, whose command line would not name the session.
+    #
+    # The salvage directory is created here, by the ssh user, because a
+    # worker in a container that runs as root would otherwise create it as
+    # root, and the ssh user could not delete the results in it afterwards.
+    tunnel_command = function() {
+      directory <- private$.session_directory
+      record <- c(
+        paste("session:", private$.session),
+        paste("controller:", private$.name),
+        paste("runtime:", private$runtime_name()),
+        paste("local_host:", Sys.info()[["nodename"]]),
+        paste("local_pid:", Sys.getpid())
+      )
+      directories <- c(
+        directory,
+        if (isTRUE(private$.salvage)) private$salvage_root()
+      )
+      paste0(
+        "mkdir -p ", paste(shQuote(directories, type = "sh"), collapse = " "),
+        " && ",
+        "printf '%s\\n' ", paste(shQuote(record, type = "sh"), collapse = " "),
+        " \"started: $(date +%s)\" > ",
+        shQuote(paste0(directory, "/session.dcf"), type = "sh"), " && ",
+        "echo $$ > ", shQuote(paste0(directory, "/tunnel.pid"), type = "sh"),
+        " && echo crew-ssh-tunnel-ready && ",
+        "exec sh -c 'cat > /dev/null; :' ",
+        shQuote(private$.session, type = "sh")
+      )
+    },
     tunnel_start = function() {
       parsed <- private$parse_url(private$.url)
       # Remote port 0 asks the remote sshd for any free port and avoids
@@ -381,7 +788,7 @@ crew_class_launcher_ssh <- R6::R6Class(
         # outright and no R finalizer ever runs. Holding the write end of the
         # ssh process's stdin makes the operating system do it: killing this
         # session closes the pipe, "cat" reads EOF and exits, and ssh follows.
-        "cat > /dev/null"
+        private$tunnel_command()
       )
       if (private$.verbose) {
         message(
@@ -401,11 +808,13 @@ crew_class_launcher_ssh <- R6::R6Class(
       private$.tunnel_port <- NULL
       pattern <- "^Allocated port ([0-9]+) for remote forward.*$"
       deadline <- as.numeric(Sys.time()) + private$.seconds_timeout
-      while (is.null(private$.tunnel_port)) {
+      ready <- FALSE
+      while (is.null(private$.tunnel_port) || !ready) {
         private$.tunnel$poll_io(250L)
         private$tunnel_drain()
         match <- grep(pattern, private$.tunnel_output, value = TRUE)
-        if (length(match)) {
+        ready <- "crew-ssh-tunnel-ready" %in% trimws(private$.tunnel_output)
+        if (length(match) && is.null(private$.tunnel_port)) {
           port <- sub(pattern, "\\1", match[1L])
           crew::crew_assert(
             grepl("^[0-9]+$", port),
@@ -415,6 +824,8 @@ crew_class_launcher_ssh <- R6::R6Class(
             )
           )
           private$.tunnel_port <- port
+        } else if (!is.null(private$.tunnel_port) && ready) {
+          break
         } else if (!private$.tunnel$is_alive()) {
           private$tunnel_fail("The ssh tunnel exited before it was ready.")
         } else if (as.numeric(Sys.time()) > deadline) {
@@ -435,13 +846,16 @@ crew_class_launcher_ssh <- R6::R6Class(
       }
       invisible()
     },
+    # processx closes a pipe once it has read to the end, after which reading
+    # it again is an error, so only pipes with more to come are read.
     tunnel_drain = function() {
-      if (is.null(private$.tunnel)) {
+      tunnel <- private$.tunnel
+      if (is.null(tunnel)) {
         return(invisible())
       }
       new <- c(
-        private$.tunnel$read_output_lines(),
-        private$.tunnel$read_error_lines()
+        if (tunnel$is_incomplete_output()) tunnel$read_output_lines(),
+        if (tunnel$is_incomplete_error()) tunnel$read_error_lines()
       )
       if (length(new)) {
         private$.tunnel_output <- c(private$.tunnel_output, new)
@@ -482,22 +896,16 @@ crew_class_launcher_ssh <- R6::R6Class(
       invisible()
     },
     workers_stop = function() {
-      pids <- vapply(private$.handles, function(x) x$pid, character(1L))
-      if (!length(pids)) {
+      handles <- private$.handles
+      if (!length(handles)) {
         return(invisible())
       }
-      # PIDs get recycled, so kill one only if its command line still shows
-      # this controller's session directory.
-      command <- sprintf(
-        paste0(
-          "for pid in %s; do ",
-          "case \"$(ps -p $pid -o args= 2>/dev/null)\" in ",
-          "*%s*) kill $pid 2>/dev/null ;; ",
-          "esac; ",
-          "done; exit 0"
-        ),
-        paste(pids, collapse = " "),
-        private$.session
+      names <- names(handles)
+      command <- remote_stop_script(
+        pids = vapply(handles, "[[", character(1L), "pid"),
+        sessions = rep(private$.session, length(names)),
+        cid_files = private$worker_paths(names)$cid,
+        runtimes = rep(private$runtime_name(), length(names))
       )
       try(
         private$run(command = command, timeout = private$.seconds_timeout),
@@ -505,11 +913,165 @@ crew_class_launcher_ssh <- R6::R6Class(
       )
       private$.handles <- list()
       invisible()
+    },
+    salvage_root = function() {
+      if (is.null(private$.salvage_directory)) {
+        paste0(private$.remote_directory, "/crew-ssh-salvage")
+      } else {
+        private$.salvage_directory
+      }
+    },
+    salvage_path = function(keys) {
+      paste0(private$salvage_root(), "/", keys, ".rds")
+    },
+    # Delete collected results in batches, each with one ssh call in the
+    # background, so collecting a task never waits on the network. With
+    # wait = TRUE, as when the launcher terminates, it deletes everything
+    # still pending before it returns.
+    salvage_flush = function(wait = FALSE) {
+      repeat {
+        if (!private$salvage_reap(wait)) {
+          return(invisible())
+        }
+        paths <- private$.salvage_pending
+        if (!length(paths)) {
+          return(invisible())
+        }
+        # Batches stay well within the length of a command line, which
+        # Windows limits to 32767 characters.
+        batch <- utils::head(paths, 100L)
+        private$.salvage_pending <- paths[-seq_along(batch)]
+        private$.salvage_deleting <- batch
+        private$.salvage_cleanup <- processx::process$new(
+          command = private$.ssh_command,
+          args = c(
+            private$ssh_args(),
+            private$.ssh_host,
+            paste(
+              "rm -f --",
+              paste(shQuote(batch, type = "sh"), collapse = " ")
+            )
+          ),
+          stdout = NULL,
+          stderr = NULL,
+          cleanup = TRUE
+        )
+        if (!wait) {
+          return(invisible())
+        }
+      }
+    },
+    # Collect the background deletion if it finished. Returns FALSE if it is
+    # still running and the caller should not wait for it.
+    salvage_reap = function(wait) {
+      process <- private$.salvage_cleanup
+      if (is.null(process)) {
+        return(TRUE)
+      }
+      if (wait) {
+        process$wait(timeout = private$.seconds_timeout * 1000)
+      }
+      if (process$is_alive()) {
+        if (!wait) {
+          return(FALSE)
+        }
+        process$kill()
+      }
+      status <- process$get_exit_status()
+      if (!identical(status, 0L)) {
+        warning(
+          "crew.ssh could not delete ", length(private$.salvage_deleting),
+          " collected result(s) from ", private$salvage_root(), " on ",
+          private$.ssh_host, " (ssh exit status ", format(status), "). ",
+          "They stay there until salvage_remove() deletes them; a saved ",
+          "result only stands in for the task that saved it.",
+          call. = FALSE
+        )
+      }
+      private$.salvage_cleanup <- NULL
+      private$.salvage_deleting <- character(0L)
+      TRUE
     }
   )
 )
 
 # Controller ----
+
+# crew's controller is a non-portable R6 class: every method, inherited ones
+# included, gets the enclosing environment of the class that is instantiated.
+# The inherited methods call crew's internal functions, so that environment
+# has to descend from crew's namespace, which is what parent_env is for. The
+# methods below call nothing from crew.ssh except through the launcher.
+crew_class_controller_ssh <- R6::R6Class(
+  classname = "crew_class_controller_ssh",
+  inherit = crew::crew_class_controller,
+  portable = FALSE,
+  cloneable = FALSE,
+  parent_env = asNamespace("crew"),
+  public = list(
+    push = function(
+      command,
+      data = list(),
+      globals = list(),
+      substitute = TRUE,
+      seed = NULL,
+      algorithm = NULL,
+      packages = character(0),
+      library = NULL,
+      seconds_timeout = NULL,
+      scale = TRUE,
+      throttle = TRUE,
+      name = NULL,
+      save_command = NULL,
+      controller = NULL
+    ) {
+      if (substitute) {
+        command <- substitute(command)
+      }
+      # Salvage needs the launcher's session, which starts with the
+      # controller.
+      start()
+      task <- .subset2(.launcher, "salvage_task")(
+        command = command,
+        data = data,
+        globals = globals,
+        seed = seed,
+        algorithm = algorithm,
+        packages = packages,
+        library = library,
+        name = name
+      )
+      super$push(
+        command = .subset2(task, "command"),
+        data = .subset2(task, "data"),
+        globals = globals,
+        substitute = FALSE,
+        seed = seed,
+        algorithm = algorithm,
+        packages = packages,
+        library = library,
+        seconds_timeout = seconds_timeout,
+        scale = scale,
+        throttle = throttle,
+        name = name,
+        save_command = save_command,
+        controller = controller
+      )
+    }
+  ),
+  private = list(
+    # pop(), collect(), and map() each call this once for every task they
+    # hand back, which makes it the one place that sees every collection.
+    .scan_crash = function(name, task) {
+      .subset2(.launcher, "salvage_collect")(
+        name = name,
+        status = .subset2(task, "status"),
+        error = .subset2(task, "error")
+      )
+      super$.scan_crash(name = name, task = task)
+    }
+  )
+)
 
 #' @title Create a controller with an `ssh` launcher.
 #' @export
@@ -542,13 +1104,13 @@ crew_class_launcher_ssh <- R6::R6Class(
 #'   crew_controller_ssh(
 #'     ssh_host = "user@example.com",
 #'     launch_prefix = c(
-#'       "docker", "run", "--rm", "--network=host",
+#'       "docker", "run", "--init", "--rm", "--network=host",
 #'       "--volume", "/tmp:/tmp", "my-image"
 #'     )
 #'   )
 #'   ```
 #'
-#'   Two details of the surrounding design decide what the prefix has to
+#'   Three details of the surrounding design decide what the prefix has to
 #'   contain.
 #'
 #'   The reverse `ssh` tunnel listens on the *remote system's* loopback
@@ -563,7 +1125,73 @@ crew_class_launcher_ssh <- R6::R6Class(
 #'   remote system and the worker reads it back by that same path, so
 #'   `remote_directory` must be visible inside the container at the path it has
 #'   outside. Worker logs are written by the remote shell rather than by the
-#'   worker itself, so `logs()` keeps working whatever the prefix does.
+#'   worker itself, so `logs()` keeps working whatever the prefix does. With
+#'   `salvage = TRUE` the worker also writes its results and records there.
+#'
+#'   Without `--init`, R is the first process of the container, and Linux
+#'   does not deliver a signal to that process unless it installed a handler
+#'   for it, which R does not for `SIGTERM`. A worker then ignores the
+#'   signal `mirai` sends it when its connection drops, keeps computing a
+#'   result nothing can collect, and outlives the session that started it.
+#'   `--init` makes a small init process the first process instead, which
+#'   passes the signal on. Use it (or an image whose entry point is an init
+#'   process such as `tini`).
+#'
+#'   When the prefix starts with `docker run` or `podman run`, the launcher
+#'   adds `--cidfile` to record each container's ID and stops a worker by
+#'   killing its container through the runtime. The process ID the launch
+#'   reports belongs to the runtime's client, and stopping the client alone
+#'   leaves the container running.
+#' @section Surviving a disconnect:
+#'   Without salvage, remote workers exit as soon as their connection to the
+#'   controller drops, so a task in progress is lost when the local session
+#'   ends or the network goes down, and runs again from the start next time.
+#'   With `salvage = TRUE`, the default:
+#'
+#'   1. A worker whose connection drops finishes the task in progress before
+#'      it exits.
+#'   2. Every worker saves the result of each task in `salvage_directory` on
+#'      the remote system before handing it back, writing to a temporary file
+#'      and renaming it, so a reader never sees a partial file. The record
+#'      holds the value or the error, the task's key, the worker, the remote
+#'      host, start and end times, and the versions of R and of every loaded
+#'      package.
+#'   3. When a later push of the same task, from this session or a later one,
+#'      finds a saved result, the worker hands that back instead of running
+#'      the task. It does so only for a task that succeeded and ran under the
+#'      same versions of R and of every package the worker has installed. An
+#'      error is never reused, and a saved file that cannot be read fails the
+#'      task with an error that names the file.
+#'   4. When the same task is still running on a worker of an earlier session,
+#'      the new worker attaches to it: it waits for that worker's result
+#'      instead of starting the task a second time, and hands the result back
+#'      when it appears. A running worker proves it is alive by touching a
+#'      heartbeat file every 15 seconds, even while R is busy. If a task's
+#'      worker dies without finishing, because it was killed, its container
+#'      was stopped, or the machine restarted, the heartbeat stops, and after
+#'      two minutes the new worker takes over and runs the task itself. While
+#'      this goes on, `remote_workers()` shows the old worker as `"running"`
+#'      and the new one as `"waiting"`.
+#'
+#'   A task is identified by its name and by everything it computes from: the
+#'   command, data, globals, seed, and packages, or for a `targets` target,
+#'   its command, seed, settings, and the hashes of the data it depends on. A
+#'   task pushed without a name, as `push()` allows, runs without salvage.
+#'   Salvage assumes a task gives the same result each time it runs with the
+#'   same inputs, which `targets` arranges by seeding every target.
+#'
+#'   A saved result is deleted once a controller collects it with `pop()`,
+#'   `collect()`, or `map()`. Results nothing collects stay until the
+#'   launcher's `salvage_remove()` deletes them; `salvage_list()` lists them.
+#'   The launcher's `remote_workers()` lists the workers of every session with
+#'   the task each is on, and `terminate_orphans()` stops the workers whose
+#'   session is gone.
+#'
+#'   Salvage writes every result to the remote disk until it is collected,
+#'   so it suits tasks that are slow to compute more than tasks that produce
+#'   a lot of data; `salvage = FALSE` turns it off. It cannot be combined
+#'   with custom `serialization`, which the saved files would not apply, so
+#'   a controller with `serialization` needs `salvage = FALSE`.
 #' @return An `R6` controller object with an `ssh` launcher.
 #' @param ssh_host Character of length 1, the `ssh` destination of the remote
 #'   system, e.g. `"user@example.com"`. Anything the `ssh` command accepts
@@ -581,17 +1209,27 @@ crew_class_launcher_ssh <- R6::R6Class(
 #'   system.
 #' @param launch_prefix Character vector, a command and its arguments to run
 #'   the worker under, e.g.
-#'   `c("docker", "run", "--rm", "--network=host", "my-image")`. Empty by
-#'   default, which runs `rscript` directly. See the "Running workers in a
-#'   container" section.
+#'   `c("docker", "run", "--init", "--rm", "--network=host", "my-image")`.
+#'   Empty by default, which runs `rscript` directly. See the "Running
+#'   workers in a container" section.
 #' @param directory Character of length 1 or `NULL`, working directory of the
 #'   workers on the remote system. `NULL` means the directory `ssh` lands in,
 #'   usually the remote home directory. This is the directory the command named
 #'   by `launch_prefix` starts in, which for a container runtime is not the
 #'   same as the working directory inside the container.
 #' @param remote_directory Character of length 1, absolute path to a directory
-#'   on the remote system where the launcher may write worker scripts and
-#'   logs.
+#'   on the remote system where the launcher may write worker scripts, logs,
+#'   and records.
+#' @param salvage Logical of length 1, whether workers save the result of
+#'   each task on the remote system so that it survives a disconnect. `TRUE`
+#'   by default; `FALSE` makes workers exit as soon as their connection drops
+#'   and saves nothing. See the "Surviving a disconnect" section.
+#' @param salvage_directory Character of length 1 or `NULL`, absolute path to
+#'   the directory on the remote system where workers save results, shared by
+#'   every session. `NULL` means the `crew-ssh-salvage` subdirectory of
+#'   `remote_directory`. `/tmp`, the default `remote_directory`, may be
+#'   cleared when the remote system restarts, so choose a durable directory
+#'   for results that must outlast that.
 #' @param verbose Logical of length 1, whether to print messages about the
 #'   tunnel and each worker launch.
 #' @param host Character of length 1, local address of the `mirai` dispatcher.
@@ -617,6 +1255,8 @@ crew_controller_ssh <- function(
   launch_prefix = character(0L),
   directory = NULL,
   remote_directory = "/tmp",
+  salvage = TRUE,
+  salvage_directory = NULL,
   verbose = FALSE,
   name = NULL,
   workers = 1L,
@@ -641,6 +1281,15 @@ crew_controller_ssh <- function(
   crashes_max = 5L,
   backup = NULL
 ) {
+  crew::crew_assert(
+    !(isTRUE(salvage) && !is.null(serialization)),
+    message = paste(
+      "salvage = TRUE (the default) cannot be combined with custom",
+      "serialization: workers save results with saveRDS(), which would not",
+      "apply it, and a value read back would be broken. Set salvage = FALSE",
+      "to use serialization."
+    )
+  )
   client <- crew::crew_client(
     host = host,
     port = port,
@@ -660,6 +1309,8 @@ crew_controller_ssh <- function(
     launch_prefix = launch_prefix,
     directory = directory,
     remote_directory = remote_directory,
+    salvage = salvage,
+    salvage_directory = salvage_directory,
     verbose = verbose,
     name = name,
     workers = workers,
@@ -674,7 +1325,7 @@ crew_controller_ssh <- function(
     r_arguments = r_arguments,
     options_metrics = options_metrics
   )
-  controller <- crew::crew_controller(
+  controller <- crew_class_controller_ssh$new(
     client = client,
     launcher = launcher,
     reset_globals = reset_globals,

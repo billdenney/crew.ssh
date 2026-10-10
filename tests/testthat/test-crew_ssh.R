@@ -99,7 +99,7 @@ test_that("worker_url() keeps the scheme and loopback host but takes the tunnel 
   expect_equal(private$worker_url(), "tls+tcp://127.0.0.1:45678")
 })
 
-test_that("the worker command uploads the script, detaches R, and reports the PID", {
+test_that("the worker command uploads the script, detaches R, and records the PID", {
   launcher <- crew_controller_ssh(
     ssh_host = "user@example.com",
     rscript = "/usr/local/bin/Rscript",
@@ -107,10 +107,7 @@ test_that("the worker command uploads the script, detaches R, and reports the PI
   )$launcher
   private <- launcher$.__enclos_env__$private
   private$.session_directory <- "/tmp/crew-ssh-abc"
-  command <- private$worker_command(
-    script = "/tmp/crew-ssh-abc/worker-1.R",
-    log = "/tmp/crew-ssh-abc/worker-1.log"
-  )
+  command <- private$worker_command("worker-1")
   expect_match(command, "^set -e; ", fixed = FALSE)
   expect_match(command, "mkdir -p '/tmp/crew-ssh-abc';", fixed = TRUE)
   expect_match(command, "cat > '/tmp/crew-ssh-abc/worker-1.R';", fixed = TRUE)
@@ -123,10 +120,34 @@ test_that("the worker command uploads the script, detaches R, and reports the PI
   # instead of waiting on the worker.
   expect_match(
     command,
-    "> '/tmp/crew-ssh-abc/worker-1.log' 2>&1 < /dev/null & echo $!",
+    "> '/tmp/crew-ssh-abc/worker-1.log' 2>&1 < /dev/null & ",
     fixed = TRUE
   )
+  # The PID goes to the session directory, where a later session finds it,
+  # and to stdout, where this launch reads it.
+  expect_true(
+    endsWith(
+      command,
+      "pid=$!; echo \"$pid\" > '/tmp/crew-ssh-abc/worker-1.pid'; echo \"$pid\""
+    )
+  )
   expect_no_match(command, "cd ", fixed = TRUE)
+})
+
+test_that("worker_paths() keeps every record of a worker in the session directory", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com"
+  )$launcher$.__enclos_env__$private
+  private$.session_directory <- "/tmp/crew-ssh-abc"
+  expect_identical(
+    private$worker_paths(c("worker-1", "worker-2")),
+    list(
+      script = c("/tmp/crew-ssh-abc/worker-1.R", "/tmp/crew-ssh-abc/worker-2.R"),
+      log = c("/tmp/crew-ssh-abc/worker-1.log", "/tmp/crew-ssh-abc/worker-2.log"),
+      pid = c("/tmp/crew-ssh-abc/worker-1.pid", "/tmp/crew-ssh-abc/worker-2.pid"),
+      cid = c("/tmp/crew-ssh-abc/worker-1.cid", "/tmp/crew-ssh-abc/worker-2.cid")
+    )
+  )
 })
 
 test_that("the worker command changes directory when asked", {
@@ -135,7 +156,7 @@ test_that("the worker command changes directory when asked", {
     directory = "/home/user/project"
   )$launcher$.__enclos_env__$private
   private$.session_directory <- "/tmp/crew-ssh-abc"
-  command <- private$worker_command(script = "s.R", log = "s.log")
+  command <- private$worker_command("worker-1")
   expect_match(command, "cd '/home/user/project';", fixed = TRUE)
   # The directory change has to happen before R starts, not after.
   expect_lt(
@@ -151,11 +172,12 @@ test_that("the worker command quotes paths that would otherwise break the shell"
     directory = "/home/user/my project"
   )$launcher$.__enclos_env__$private
   private$.session_directory <- "/tmp/crew ssh"
-  command <- private$worker_command(script = "/tmp/crew ssh/w.R", log = "/l.log")
+  command <- private$worker_command("worker-1")
   expect_match(command, "mkdir -p '/tmp/crew ssh';", fixed = TRUE)
   expect_match(command, "cd '/home/user/my project';", fixed = TRUE)
   expect_match(command, "nohup '/opt/R 4.6/bin/Rscript'", fixed = TRUE)
-  expect_match(command, "'/tmp/crew ssh/w.R'", fixed = TRUE)
+  expect_match(command, "'/tmp/crew ssh/worker-1.R'", fixed = TRUE)
+  expect_match(command, "> '/tmp/crew ssh/worker-1.pid'", fixed = TRUE)
 })
 
 test_that("no launch_prefix leaves the worker command running Rscript directly", {
@@ -163,34 +185,53 @@ test_that("no launch_prefix leaves the worker command running Rscript directly",
     ssh_host = "user@example.com"
   )$launcher$.__enclos_env__$private
   private$.session_directory <- "/tmp/crew-ssh-abc"
-  command <- private$worker_command(script = "s.R", log = "s.log")
+  command <- private$worker_command("worker-1")
   expect_match(command, "nohup 'Rscript' '--no-save'", fixed = TRUE)
+  expect_no_match(command, "--cidfile", fixed = TRUE)
 })
 
-test_that("launch_prefix runs the worker under a container runtime", {
+test_that("launch_prefix runs the worker under a container runtime that records its ID", {
   private <- crew_controller_ssh(
     ssh_host = "user@example.com",
     launch_prefix = c(
-      "docker", "run", "--rm", "--network=host",
+      "docker", "run", "--init", "--rm", "--network=host",
       "--volume", "/tmp:/tmp", "my-image"
     )
   )$launcher$.__enclos_env__$private
   private$.session_directory <- "/tmp/crew-ssh-abc"
   expect_identical(
-    private$worker_command(
-      script = "/tmp/crew-ssh-abc/worker-1.R",
-      log = "/tmp/crew-ssh-abc/worker-1.log"
-    ),
+    private$worker_command("worker-1"),
     paste0(
       "set -e; mkdir -p '/tmp/crew-ssh-abc'; ",
       "cat > '/tmp/crew-ssh-abc/worker-1.R'; ",
-      "nohup 'docker' 'run' '--rm' '--network=host' ",
+      "nohup 'docker' 'run' '--cidfile' '/tmp/crew-ssh-abc/worker-1.cid' ",
+      "'--init' '--rm' '--network=host' ",
       "'--volume' '/tmp:/tmp' 'my-image' ",
       "'Rscript' '--no-save' '--no-restore' ",
       "'/tmp/crew-ssh-abc/worker-1.R' ",
-      "> '/tmp/crew-ssh-abc/worker-1.log' 2>&1 < /dev/null & echo $!"
+      "> '/tmp/crew-ssh-abc/worker-1.log' 2>&1 < /dev/null & ",
+      "pid=$!; echo \"$pid\" > '/tmp/crew-ssh-abc/worker-1.pid'; echo \"$pid\""
     )
   )
+})
+
+prefix_runtime <- function(prefix) {
+  crew_controller_ssh(
+    ssh_host = "user@example.com",
+    launch_prefix = prefix
+  )$launcher$.__enclos_env__$private$container_runtime()
+}
+
+test_that("container_runtime() recognizes docker run and podman run only", {
+  runtime <- prefix_runtime
+  expect_identical(runtime(c("docker", "run", "img")), "docker")
+  expect_identical(runtime(c("podman", "run", "img")), "podman")
+  expect_identical(runtime(c("/usr/bin/docker", "run", "img")), "/usr/bin/docker")
+  expect_null(runtime(character(0L)))
+  expect_null(runtime("docker"))
+  expect_null(runtime(c("docker", "container", "run", "img")))
+  expect_null(runtime(c("apptainer", "exec", "img.sif")))
+  expect_null(runtime(c("sudo", "docker", "run", "img")))
 })
 
 test_that("the prefix precedes Rscript, and Rscript's arguments stay with Rscript", {
@@ -204,8 +245,12 @@ test_that("the prefix precedes Rscript, and Rscript's arguments stay with Rscrip
   # The arguments belong to the R inside the container, so they have to follow
   # the image name rather than the container runtime.
   expect_match(
-    private$worker_command(script = "s.R", log = "s.log"),
-    "nohup 'docker' 'run' 'my-image' '/usr/local/bin/Rscript' '--vanilla' 's.R'",
+    private$worker_command("worker-1"),
+    paste(
+      "nohup 'docker' 'run' '--cidfile' '/tmp/crew-ssh-abc/worker-1.cid'",
+      "'my-image' '/usr/local/bin/Rscript' '--vanilla'",
+      "'/tmp/crew-ssh-abc/worker-1.R'"
+    ),
     fixed = TRUE
   )
 })
@@ -217,7 +262,7 @@ test_that("a prefix element containing spaces stays a single argument", {
   )$launcher$.__enclos_env__$private
   private$.session_directory <- "/tmp/crew-ssh-abc"
   expect_match(
-    private$worker_command(script = "s.R", log = "s.log"),
+    private$worker_command("worker-1"),
     "'--volume' '/home/my data:/data' 'img'",
     fixed = TRUE
   )
@@ -245,6 +290,26 @@ test_that("launch_prefix rejects values the remote shell could not use", {
   )
 })
 
+test_that("launch_prefix may not set the --cidfile crew.ssh sets", {
+  for (prefix in list(
+    c("docker", "run", "--cidfile", "/tmp/x", "img"),
+    c("podman", "run", "--cidfile=/tmp/x", "img")
+  )) {
+    expect_error(
+      crew_controller_ssh(ssh_host = "user@example.com", launch_prefix = prefix),
+      "launch_prefix must not set --cidfile",
+      class = "crew_error"
+    )
+  }
+  # Without a container runtime crew.ssh adds nothing, so nothing conflicts.
+  expect_silent(
+    crew_controller_ssh(
+      ssh_host = "user@example.com",
+      launch_prefix = c("wrapper", "--cidfile", "x")
+    )
+  )
+})
+
 test_that("an empty launch_prefix means no prefix", {
   private <- crew_controller_ssh(
     ssh_host = "user@example.com",
@@ -252,7 +317,7 @@ test_that("an empty launch_prefix means no prefix", {
   )$launcher$.__enclos_env__$private
   private$.session_directory <- "/tmp/crew-ssh-abc"
   expect_match(
-    private$worker_command(script = "s.R", log = "s.log"),
+    private$worker_command("worker-1"),
     "nohup 'Rscript'",
     fixed = TRUE
   )
@@ -266,6 +331,931 @@ test_that("logs() short-circuits before any worker has launched", {
 test_that("terminate() is a no-op before the launcher starts", {
   launcher <- crew_controller_ssh(ssh_host = "user@example.com")$launcher
   expect_silent(launcher$terminate())
+})
+
+test_that("crew_controller_ssh() returns crew.ssh's controller class", {
+  controller <- crew_controller_ssh(ssh_host = "user@example.com")
+  expect_identical(
+    class(controller),
+    c("crew_class_controller_ssh", "crew_class_controller", "R6")
+  )
+})
+
+test_that("the salvage arguments are validated", {
+  expect_error(
+    crew_controller_ssh(ssh_host = "user@example.com", salvage = NA),
+    "salvage must be TRUE or FALSE.",
+    class = "crew_error"
+  )
+  expect_error(
+    crew_controller_ssh(ssh_host = "user@example.com", salvage = c(TRUE, FALSE)),
+    class = "crew_error"
+  )
+  for (directory in list("relative/path", "~/salvage", NA_character_, c("/a", "/b"), 1)) {
+    expect_error(
+      crew_controller_ssh(
+        ssh_host = "user@example.com",
+        salvage_directory = directory
+      ),
+      "salvage_directory must be NULL or an absolute path",
+      class = "crew_error"
+    )
+  }
+  expect_error(
+    crew_controller_ssh(
+      ssh_host = "user@example.com",
+      salvage = TRUE,
+      serialization = mirai::serial_config("custom", identity, identity)
+    ),
+    "cannot be combined with custom serialization",
+    class = "crew_error"
+  )
+})
+
+test_that("salvage is on unless it is turned off", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com"
+  )$launcher$.__enclos_env__$private
+  expect_true(private$.salvage)
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    salvage = FALSE
+  )$launcher$.__enclos_env__$private
+  expect_false(private$.salvage)
+})
+
+test_that("custom serialization needs salvage = FALSE, and says so", {
+  serialization <- mirai::serial_config("custom", identity, identity)
+  expect_error(
+    crew_controller_ssh(
+      ssh_host = "user@example.com",
+      serialization = serialization
+    ),
+    "Set salvage = FALSE to use serialization.",
+    fixed = TRUE,
+    class = "crew_error"
+  )
+  expect_s3_class(
+    crew_controller_ssh(
+      ssh_host = "user@example.com",
+      serialization = serialization,
+      salvage = FALSE
+    ),
+    "crew_class_controller_ssh"
+  )
+})
+
+test_that("the salvage directory defaults to one shared by all sessions", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    remote_directory = "/scratch"
+  )$launcher$.__enclos_env__$private
+  expect_identical(private$salvage_root(), "/scratch/crew-ssh-salvage")
+  expect_identical(
+    private$salvage_path(c("a-1", "b-2")),
+    c("/scratch/crew-ssh-salvage/a-1.rds", "/scratch/crew-ssh-salvage/b-2.rds")
+  )
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    salvage_directory = "/data/results"
+  )$launcher$.__enclos_env__$private
+  expect_identical(private$salvage_root(), "/data/results")
+})
+
+test_that("the tunnel command records the session and then waits on stdin", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    name = "ctl",
+    launch_prefix = c("docker", "run", "img"),
+    salvage = FALSE
+  )$launcher$.__enclos_env__$private
+  private$.session <- "crew-ssh-abc"
+  private$.session_directory <- "/tmp/crew-ssh-abc"
+  expect_identical(
+    private$tunnel_command(),
+    paste0(
+      "mkdir -p '/tmp/crew-ssh-abc' && ",
+      "printf '%s\\n' 'session: crew-ssh-abc' 'controller: ctl' ",
+      "'runtime: docker' 'local_host: ", Sys.info()[["nodename"]], "' ",
+      "'local_pid: ", Sys.getpid(), "' \"started: $(date +%s)\" > ",
+      "'/tmp/crew-ssh-abc/session.dcf' && ",
+      "echo $$ > '/tmp/crew-ssh-abc/tunnel.pid' && ",
+      "echo crew-ssh-tunnel-ready && ",
+      "exec sh -c 'cat > /dev/null; :' 'crew-ssh-abc'"
+    )
+  )
+  private$.salvage <- TRUE
+  expect_match(
+    private$tunnel_command(),
+    "^mkdir -p '/tmp/crew-ssh-abc' '/tmp/crew-ssh-salvage' && "
+  )
+})
+
+test_that("salvage_task() leaves a task alone without salvage or a name", {
+  launcher <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    salvage = FALSE
+  )$launcher
+  task <- launcher$salvage_task(
+    command = quote(f(x)),
+    data = list(x = 1),
+    globals = list(),
+    seed = NULL,
+    algorithm = NULL,
+    packages = character(0L),
+    library = NULL,
+    name = "fit"
+  )
+  expect_identical(task, list(command = quote(f(x)), data = list(x = 1)))
+  launcher <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    salvage = TRUE
+  )$launcher
+  expect_identical(
+    launcher$salvage_task(
+      command = quote(f(x)),
+      data = list(x = 1),
+      globals = list(),
+      seed = NULL,
+      algorithm = NULL,
+      packages = character(0L),
+      library = NULL,
+      name = NULL
+    ),
+    list(command = quote(f(x)), data = list(x = 1))
+  )
+  expect_identical(
+    launcher$salvage_task(
+      command = quote(f(x)),
+      data = list(x = 1),
+      globals = list(),
+      seed = NULL,
+      algorithm = NULL,
+      packages = character(0L),
+      library = NULL,
+      name = ""
+    ),
+    list(command = quote(f(x)), data = list(x = 1))
+  )
+  # A collection before the launcher ever started has nothing to note.
+  expect_null(launcher$salvage_collect(name = "fit", status = "success"))
+  # A named task needs the session's settings, which start() makes.
+  expect_error(
+    launcher$salvage_task(
+      command = quote(f(x)),
+      data = list(),
+      globals = list(),
+      seed = NULL,
+      algorithm = NULL,
+      packages = character(0L),
+      library = NULL,
+      name = "fit"
+    ),
+    "must be started before tasks are pushed",
+    class = "crew_error"
+  )
+})
+
+# A launcher with salvage whose session is set up without opening a tunnel.
+# The remote system's paths are POSIX paths, which a Windows temporary
+# directory is not, and Windows cannot be the remote system.
+salvage_launcher <- function(remote_directory = remote_tempdir()) {
+  skip_on_os("windows")
+  launcher <- crew_controller_ssh(
+    ssh_host = "fakehost",
+    ssh_command = fake_ssh(),
+    remote_directory = remote_directory,
+    salvage = TRUE
+  )$launcher
+  private <- launcher$.__enclos_env__$private
+  private$.session <- "crew-ssh-abc"
+  private$.session_directory <- file.path(remote_directory, "crew-ssh-abc")
+  private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
+  private$.salvage_collected <- new.env(hash = TRUE, parent = emptyenv())
+  private$.salvage_shipped <- salvage_shipped(
+    directory = private$salvage_root(),
+    session = private$.session,
+    session_directory = private$.session_directory,
+    controller = "ctl",
+    seconds = private$.salvage_seconds
+  )
+  launcher
+}
+
+push_fit <- function(launcher, data = list(x = 1)) {
+  launcher$salvage_task(
+    command = quote(f(x)),
+    data = data,
+    globals = list(f = plus_one_global),
+    seed = 1L,
+    algorithm = NULL,
+    packages = character(0L),
+    library = NULL,
+    name = "fit"
+  )
+}
+
+plus_one_global <- global_function(function(x) x + 1)
+
+test_that("salvage_task() wraps a named task to run under salvage", {
+  launcher <- salvage_launcher()
+  private <- launcher$.__enclos_env__$private
+  task <- push_fit(launcher)
+  key <- salvage_key(
+    command = quote(f(x)),
+    data = list(x = 1),
+    globals_hash = salvage_globals_hash(list(f = plus_one_global)),
+    seed = 1L,
+    algorithm = NULL,
+    packages = character(0L),
+    library = NULL,
+    name = "fit"
+  )
+  expect_identical(
+    task$command,
+    substitute(
+      .crew_ssh_salvage$run(
+        expr = quote(f(x)),
+        envir = environment(),
+        key = key,
+        name = "fit",
+        reuse = TRUE,
+        salvage = .crew_ssh_salvage
+      ),
+      list(key = key)
+    )
+  )
+  expect_identical(names(task$data), c("x", ".crew_ssh_salvage"))
+  expect_identical(task$data$.crew_ssh_salvage, private$.salvage_shipped)
+  expect_identical(as.list(private$.salvage_keys), list(fit = key))
+  expect_error(
+    push_fit(launcher, data = list(.crew_ssh_salvage = 1)),
+    "must not contain .crew_ssh_salvage",
+    class = "crew_error"
+  )
+})
+
+test_that("collecting a task queues its saved result for deletion", {
+  launcher <- salvage_launcher()
+  private <- launcher$.__enclos_env__$private
+  task <- push_fit(launcher)
+  key <- private$.salvage_keys$fit
+  # Tasks this launcher never saw, and crashes, leave everything as it was.
+  launcher$salvage_collect(name = "other", status = "success")
+  launcher$salvage_collect(name = "fit", status = "crash")
+  expect_identical(as.list(private$.salvage_keys), list(fit = key))
+  expect_identical(private$.salvage_pending, character(0L))
+  launcher$salvage_collect(name = "fit", status = "success")
+  expect_identical(ls(private$.salvage_keys), character(0L))
+  expect_identical(ls(private$.salvage_collected), key)
+  # The deletion started in the background with what was pending.
+  expect_identical(private$.salvage_deleting, private$salvage_path(key))
+  private$salvage_flush(wait = TRUE)
+  expect_null(private$.salvage_cleanup)
+  # Pushing it again asks for a new run, not for the result just collected.
+  task <- push_fit(launcher)
+  expect_false(task$command$reuse)
+  launcher$salvage_collect(name = "fit", status = "cancel")
+  expect_identical(private$.salvage_pending, character(0L))
+})
+
+# What the launcher keeps after crew hands back a task with this status.
+collect_with_status <- function(launcher, status, error) {
+  private <- launcher$.__enclos_env__$private
+  push_fit(launcher)
+  launcher$salvage_collect(name = "fit", status = status, error = error)
+  out <- list(
+    key_kept = exists("fit", envir = private$.salvage_keys, inherits = FALSE),
+    collected = length(ls(private$.salvage_collected)),
+    pending = length(private$.salvage_pending)
+  )
+  private$.salvage_collected <- new.env(hash = TRUE, parent = emptyenv())
+  private$.salvage_pending <- character(0L)
+  private$.salvage_cleanup <- NULL
+  out
+}
+
+test_that("only a task that delivered an outcome has its saved result deleted", {
+  launcher <- salvage_launcher()
+  delivered <- list(key_kept = FALSE, collected = 1L, pending = 0L)
+  # The deletion is already under way in the background, which is why nothing
+  # is left pending.
+  expect_identical(
+    collect_with_status(launcher, "success", NA_character_),
+    delivered
+  )
+  expect_identical(collect_with_status(launcher, "error", "boom"), delivered)
+  # crew reports a task it returned before the task resolved as an error with
+  # no message. That task is still running, and its result is not collected.
+  not_delivered <- list(key_kept = FALSE, collected = 0L, pending = 0L)
+  expect_identical(
+    collect_with_status(launcher, "error", NA_character_),
+    not_delivered
+  )
+  expect_identical(
+    collect_with_status(launcher, "cancel", "canceled"),
+    not_delivered
+  )
+  # A crash keeps the key, because the task is pushed again under the same
+  # name.
+  expect_identical(
+    collect_with_status(launcher, "crash", "worker exited"),
+    list(key_kept = TRUE, collected = 0L, pending = 0L)
+  )
+})
+
+test_that("pushing a task again cancels the deletion of its result", {
+  launcher <- salvage_launcher()
+  private <- launcher$.__enclos_env__$private
+  push_fit(launcher)
+  key <- private$.salvage_keys$fit
+  private$.salvage_pending <- c(private$salvage_path(key), "/elsewhere.rds")
+  # A deletion still running blocks a new one, so the pending list stays.
+  private$.salvage_cleanup <- processx::process$new("sleep", "5")
+  on.exit(private$.salvage_cleanup$kill())
+  push_fit(launcher)
+  expect_identical(private$.salvage_pending, "/elsewhere.rds")
+})
+
+test_that("a deletion that fails says so", {
+  skip_without_fake_ssh()
+  launcher <- salvage_launcher()
+  private <- launcher$.__enclos_env__$private
+  private$.ssh_command <- write_executable(c("#!/bin/sh", "exit 3"))
+  private$.salvage_pending <- c("/remote/a.rds", "/remote/b.rds")
+  expect_warning(
+    private$salvage_flush(wait = TRUE),
+    "crew.ssh could not delete 2 collected result(s)",
+    fixed = TRUE
+  )
+  expect_identical(private$.salvage_pending, character(0L))
+  expect_null(private$.salvage_cleanup)
+})
+
+test_that("deletions go out in batches of 100", {
+  skip_without_fake_ssh()
+  launcher <- salvage_launcher()
+  private <- launcher$.__enclos_env__$private
+  log <- tempfile()
+  private$.ssh_command <- write_executable(
+    c("#!/bin/sh", paste0("echo \"$#\" >> ", shQuote(log, type = "sh")))
+  )
+  private$.salvage_pending <- sprintf("/remote/%03d.rds", seq_len(250L))
+  private$salvage_flush(wait = FALSE)
+  expect_identical(length(private$.salvage_pending), 150L)
+  private$salvage_flush(wait = TRUE)
+  expect_identical(private$.salvage_pending, character(0L))
+  # Three ssh calls, each with its options, the host, and one command.
+  expect_identical(readLines(log), c("4", "4", "4"))
+})
+
+# Integration ----
+# These run real workers through the fake ssh above, so the "remote" system is
+# this machine.
+
+test_that("a session records itself and its tunnel on the remote system", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  controller <- fake_controller(remote, salvage = TRUE, name = "ctl")
+  on.exit(controller$terminate())
+  controller$start()
+  private <- controller$launcher$.__enclos_env__$private
+  session <- private$.session
+  record <- read.dcf(file.path(remote, session, "session.dcf"))
+  expect_identical(
+    colnames(record),
+    c("session", "controller", "runtime", "local_host", "local_pid", "started")
+  )
+  expect_identical(
+    unname(record[1L, c("session", "controller", "local_pid")]),
+    c(session, "ctl", as.character(Sys.getpid()))
+  )
+  expect_true(is.na(record[1L, "runtime"]) || !nzchar(record[1L, "runtime"]))
+  expect_identical(
+    as.integer(readLines(file.path(remote, session, "tunnel.pid"))),
+    private$.tunnel$get_pid()
+  )
+  expect_true(dir.exists(file.path(remote, "crew-ssh-salvage")))
+  settings <- controller$launcher$settings()
+  # mirai finishes the task in progress before exiting when autoexit is NA.
+  expect_identical(settings$autoexit, NA)
+  expect_identical(settings$url, controller$client$url)
+})
+
+test_that("without salvage, workers keep crew's exit-at-once setting", {
+  skip_without_fake_ssh()
+  controller <- fake_controller(remote_tempdir(), salvage = FALSE)
+  on.exit(controller$terminate())
+  controller$start()
+  expect_identical(
+    controller$launcher$settings()$autoexit,
+    crew::crew_terminate_signal()
+  )
+  private <- controller$launcher$.__enclos_env__$private
+  expect_false(
+    dir.exists(file.path(private$.remote_directory, "crew-ssh-salvage"))
+  )
+})
+
+test_that("a tunnel that exits before it is ready fails loudly", {
+  skip_without_fake_ssh()
+  controller <- crew_controller_ssh(
+    ssh_host = "fakehost",
+    ssh_command = write_executable(
+      c("#!/bin/sh", "echo 'ssh: connect to host fakehost: refused' >&2", "exit 255")
+    ),
+    remote_directory = remote_tempdir()
+  )
+  expect_error(
+    controller$start(),
+    paste0(
+      "The ssh tunnel exited before it was ready. ssh output:\n",
+      "ssh: connect to host fakehost: refused"
+    ),
+    fixed = TRUE
+  )
+  controller$terminate()
+})
+
+test_that("a tunnel that never gets ready times out", {
+  skip_without_fake_ssh()
+  controller <- crew_controller_ssh(
+    ssh_host = "fakehost",
+    ssh_command = write_executable(c("#!/bin/sh", "cat > /dev/null")),
+    remote_directory = remote_tempdir(),
+    seconds_timeout = 1
+  )
+  expect_error(
+    controller$start(),
+    "The ssh tunnel did not report a forwarded port within 1 seconds.",
+    fixed = TRUE
+  )
+  controller$terminate()
+})
+
+test_that("a tunnel that dropped is reopened at the next launch", {
+  skip_without_fake_ssh()
+  controller <- fake_controller(remote_tempdir())
+  on.exit(controller$terminate())
+  controller$start()
+  private <- controller$launcher$.__enclos_env__$private
+  old <- private$.tunnel$get_pid()
+  # A tunnel dies on its own, as when the network drops, not through the
+  # handle crew.ssh holds.
+  tools::pskill(old)
+  wait_until(!private$.tunnel$is_alive(), seconds = 10)
+  expect_message(
+    controller$launcher$launch_worker(controller$launcher$call()),
+    "is down. Reopening it.",
+    fixed = TRUE
+  )
+  expect_false(identical(private$.tunnel$get_pid(), old))
+  expect_true(private$.tunnel$is_alive())
+})
+
+test_that("a saved result lives until its task is collected", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate())
+  controller$start()
+  controller$push(command = sqrt(x), data = list(x = 49), name = "seven")
+  controller$push(command = sqrt(x), data = list(x = 64))
+  controller$wait(mode = "all", seconds_timeout = 60)
+  saved <- list.files(file.path(remote, "crew-ssh-salvage"))
+  # The unnamed task has no identity a later push could match, so nothing of
+  # it is saved.
+  expect_identical(length(saved), 1L)
+  expect_match(saved, "^seven-[0-9a-f]{32}\\.rds$")
+  results <- list(controller$pop(), controller$pop())
+  values <- vapply(lapply(results, "[[", "result"), "[[", numeric(1L), 1L)
+  expect_setequal(values, c(7, 8))
+  expect_identical(vapply(results, "[[", character(1L), "status"), c("success", "success"))
+  workers <- controller$launcher$remote_workers()
+  expect_identical(nrow(workers), 1L)
+  expect_identical(workers$task_name, "seven")
+  expect_identical(workers$task_state, "success")
+  expect_true(workers$alive)
+  expect_true(workers$session_alive)
+  expect_true(workers$current)
+  expect_true(any(grepl(workers$worker, controller$launcher$logs(lines = 5L))))
+  controller$terminate()
+  expect_identical(list.files(file.path(remote, "crew-ssh-salvage")), character(0L))
+  # terminate() stopped the worker.
+  wait_until(!pid_alive(workers$pid), seconds = 10)
+})
+
+test_that("collect() and controller groups delete what they collect", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  controller <- fake_controller(remote, salvage = TRUE, name = "remote")
+  group <- crew::crew_controller_group(controller)
+  on.exit(group$terminate())
+  group$start()
+  group$push(command = x + 1, data = list(x = 1), name = "pushed")
+  group$wait(mode = "all", seconds_timeout = 60)
+  expect_identical(group$pop()$result[[1L]], 2)
+  controller$push(command = x + 1, data = list(x = 2), name = "collected")
+  controller$wait(mode = "all", seconds_timeout = 60)
+  expect_identical(controller$collect()$result[[1L]], 3)
+  # walk() pushes one task per element and collect() hands them back. map()
+  # does the same in one call, but crew 1.3.2 can return from it before its
+  # tasks resolve, which a loaded machine makes common.
+  controller$walk(
+    command = x + 1,
+    iterate = list(x = c(3, 4), name = c("w1", "w2")),
+    names = "name",
+    verbose = FALSE
+  )
+  controller$wait(mode = "all", seconds_timeout = 60)
+  walked <- controller$collect()
+  expect_setequal(walked$name, c("w1", "w2"))
+  expect_setequal(unlist(walked$result), c(4, 5))
+  private <- controller$launcher$.__enclos_env__$private
+  expect_identical(length(ls(private$.salvage_collected)), 4L)
+  private$salvage_flush(wait = TRUE)
+  expect_identical(list.files(file.path(remote, "crew-ssh-salvage")), character(0L))
+})
+
+test_that("terminate() stops a worker in the middle of a task", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  started <- file.path(remote, "started")
+  controller <- fake_controller(remote)
+  on.exit(controller$terminate())
+  controller$start()
+  controller$push(
+    command = {
+      file.create(started)
+      Sys.sleep(120)
+    },
+    data = list(started = started)
+  )
+  wait_until({
+    controller$scale()
+    file.exists(started)
+  })
+  pid <- as.integer(
+    readLines(list.files(remote, "\\.pid$", recursive = TRUE, full.names = TRUE)[
+      grepl("worker-", list.files(remote, "\\.pid$", recursive = TRUE))
+    ])
+  )
+  expect_true(pid_alive(pid))
+  controller$terminate()
+  wait_until(!pid_alive(pid), seconds = 10)
+})
+
+test_that("a worker under a container runtime is found and stopped by its container ID", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  log <- tempfile()
+  started <- file.path(remote, "started")
+  docker <- fake_docker(log)
+  controller <- fake_controller(
+    remote,
+    launch_prefix = c(docker, "run", "image")
+  )
+  on.exit(controller$terminate())
+  controller$start()
+  controller$push(
+    command = {
+      file.create(started)
+      Sys.sleep(120)
+    },
+    data = list(started = started)
+  )
+  wait_until(
+    {
+      controller$scale()
+      file.exists(started)
+    },
+    seconds = 120
+  )
+  handles <- controller$launcher$.__enclos_env__$private$.handles
+  expect_length(handles, 1L)
+  cid_file <- handles[[1L]]$container
+  expect_match(cid_file, "/worker-[0-9a-f]+\\.cid$")
+  cid <- readLines(cid_file, warn = FALSE)
+  expect_match(cid, "^fakecid-[0-9]+$")
+  workers <- controller$launcher$remote_workers()
+  expect_identical(workers$container, cid)
+  expect_identical(workers$runtime, docker)
+  expect_true(workers$alive)
+  pid <- as.integer(handles[[1L]]$pid)
+  controller$terminate()
+  # The runtime is asked to kill the container, whose ID it wrote, and the
+  # runtime's own client process is signalled too.
+  expect_identical(readLines(log), paste("kill", cid))
+  wait_until(!pid_alive(pid), seconds = 10)
+})
+
+worker_pid <- function(remote, session) {
+  files <- list.files(
+    file.path(remote, session),
+    pattern = "^worker-.*\\.pid$",
+    full.names = TRUE
+  )
+  as.integer(readLines(files))
+}
+
+other_session <- function(remote, current) {
+  sessions <- list.files(remote, pattern = "^crew-ssh-[0-9a-f]+$")
+  setdiff(sessions, current)
+}
+
+test_that("a worker that loses its session finishes, saves, and hands over", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  session <- session_in_background(
+    remote,
+    command = counted_task(seconds = 4),
+    data = list(counter = counter),
+    name = "slow"
+  )
+  on.exit(session$kill())
+  wait_until(file.exists(counter))
+  # The session dies the way a closed laptop's does, with no chance to clean
+  # up.
+  session$kill()
+  old <- other_session(remote, current = NULL)
+  wait_until(
+    length(list.files(file.path(remote, "crew-ssh-salvage"), "^slow-.*\\.rds$")) == 1L
+  )
+  wait_until(!pid_alive(worker_pid(remote, old)), seconds = 30)
+  log <- readLines(list.files(file.path(remote, old), "\\.log$", full.names = TRUE))
+  expect_true(any(grepl("crew worker finished normally", log, fixed = TRUE)))
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  controller$start()
+  workers <- controller$launcher$remote_workers()
+  expect_identical(workers$session, old)
+  expect_identical(workers$alive, FALSE)
+  expect_identical(workers$session_alive, FALSE)
+  expect_identical(workers$task_state, "success")
+  controller$push(
+    command = counted_task(seconds = 4),
+    data = list(counter = counter),
+    name = "slow",
+    substitute = FALSE
+  )
+  controller$wait(mode = "all", seconds_timeout = 60)
+  out <- controller$pop()
+  expect_identical(out$result[[1L]], 42L)
+  expect_identical(count_runs(counter), 1L)
+  controller$terminate()
+  expect_identical(list.files(file.path(remote, "crew-ssh-salvage")), character(0L))
+})
+
+test_that("a reconnecting session waits for a task still running, then collects it", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  session <- session_in_background(
+    remote,
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow"
+  )
+  on.exit(session$kill())
+  wait_until(file.exists(counter))
+  # The session dies the way a closed laptop's does, with the task running.
+  session$kill()
+  old <- other_session(remote, current = NULL)
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  controller$start()
+  controller$push(
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow",
+    substitute = FALSE
+  )
+  # The new session's worker finds the task running and attaches to it.
+  wait_until(
+    {
+      controller$scale()
+      identical(sort(unname(task_states(remote))), c("running", "waiting"))
+    },
+    seconds = 120
+  )
+  workers <- controller$launcher$remote_workers()
+  workers <- workers[order(workers$session_alive), ]
+  expect_identical(workers$task_state, c("running", "waiting"))
+  expect_identical(workers$session_alive, c(FALSE, TRUE))
+  expect_identical(workers$alive, c(TRUE, TRUE))
+  expect_identical(workers$task_key[1L], workers$task_key[2L])
+  expect_identical(controller$launcher$salvage_list()$state, "running")
+  # While the old worker computes, the new session has nothing to collect.
+  Sys.sleep(2)
+  expect_identical(controller$unresolved(), 1L)
+  expect_null(controller$pop())
+  file.create(release)
+  controller$wait(mode = "all", seconds_timeout = 120)
+  out <- controller$pop()
+  expect_identical(out$status, "success")
+  expect_identical(out$result[[1L]], 42L)
+  expect_identical(count_runs(counter), 1L)
+  log <- controller$launcher$logs()
+  expect_true(any(grepl("so this worker waits for its result", log, fixed = TRUE)))
+  expect_true(any(grepl("reuses the result worker", log, fixed = TRUE)))
+  controller$terminate()
+  expect_identical(list.files(file.path(remote, "crew-ssh-salvage")), character(0L))
+  wait_until(!pid_alive(worker_pid(remote, old)), seconds = 30)
+})
+
+test_that("a task whose worker was killed outright is run again once its lock goes quiet", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  session <- session_in_background(
+    remote,
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow"
+  )
+  on.exit(session$kill())
+  wait_until(file.exists(counter))
+  session$kill()
+  old <- other_session(remote, current = NULL)
+  pid <- worker_pid(remote, old)
+  # No chance to finish, save, or release the lock.
+  tools::pskill(pid, tools::SIGKILL)
+  wait_until(!pid_alive(pid), seconds = 10)
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  controller$start()
+  file.create(release)
+  controller$push(
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow",
+    substitute = FALSE
+  )
+  controller$wait(mode = "all", seconds_timeout = 120)
+  expect_identical(controller$pop()$result[[1L]], 42L)
+  # The first run died with its worker and the second finished the task.
+  expect_identical(count_runs(counter), 2L)
+  log <- controller$launcher$logs()
+  expect_true(
+    any(grepl("which went silent", log, fixed = TRUE)),
+    info = paste(log, collapse = "\n")
+  )
+})
+
+test_that("terminate_orphans() stops the workers of sessions that are gone", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  session <- session_in_background(
+    remote,
+    command = counted_task(seconds = 120),
+    data = list(counter = counter),
+    name = "endless"
+  )
+  on.exit(session$kill())
+  wait_until(file.exists(counter))
+  session$kill()
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  controller$start()
+  wait_until(
+    identical(controller$launcher$remote_workers()$session_alive, FALSE)
+  )
+  orphans <- controller$launcher$remote_workers()
+  expect_identical(orphans$alive, TRUE)
+  expect_identical(orphans$task_state, "running")
+  stopped <- controller$launcher$terminate_orphans()
+  expect_identical(stopped$worker, orphans$worker)
+  wait_until(!pid_alive(orphans$pid), seconds = 10)
+  expect_identical(nrow(controller$launcher$terminate_orphans()), 0L)
+  # Its lock outlives it, and goes quiet.
+  wait_until(
+    identical(controller$launcher$salvage_list()$state, "abandoned"),
+    seconds = 30
+  )
+})
+
+test_that("salvage_list() and salvage_remove() manage results nothing collects", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  directory <- file.path(remote, "crew-ssh-salvage")
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate())
+  controller$start()
+  expect_identical(nrow(controller$launcher$salvage_list()), 0L)
+  saveRDS(list(1), file.path(directory, "old-1.rds"))
+  saveRDS(list(2), file.path(directory, "old-2.rds"))
+  listed <- controller$launcher$salvage_list()
+  expect_identical(listed$key, c("old-1", "old-2"))
+  expect_identical(listed$state, c("saved", "saved"))
+  expect_identical(
+    listed$bytes,
+    as.numeric(file.size(file.path(directory, c("old-1.rds", "old-2.rds"))))
+  )
+  expect_identical(controller$launcher$salvage_remove("old-1"), "old-1")
+  expect_identical(list.files(directory), "old-2.rds")
+  expect_identical(controller$launcher$salvage_remove(character(0L)), character(0L))
+  for (keys in list("../old-2", "a b", NA_character_, 1L, "x;rm")) {
+    expect_error(
+      controller$launcher$salvage_remove(keys),
+      "keys must be task keys",
+      class = "crew_error"
+    )
+  }
+  expect_identical(list.files(directory), "old-2.rds")
+})
+
+test_that("remote commands that fail raise errors that name the host", {
+  skip_without_fake_ssh()
+  controller <- crew_controller_ssh(
+    ssh_host = "fakehost",
+    ssh_command = write_executable(c("#!/bin/sh", "echo 'no route' >&2", "exit 255")),
+    remote_directory = remote_tempdir()
+  )
+  launcher <- controller$launcher
+  expect_error(
+    launcher$remote_workers(),
+    paste0(
+      "crew.ssh could not list the remote workers on fakehost. ",
+      "ssh exited with status 255.\nstderr: no route"
+    ),
+    fixed = TRUE
+  )
+  expect_error(launcher$salvage_list(), "could not list the saved results", fixed = TRUE)
+  expect_error(launcher$salvage_remove("a-1"), "could not delete the saved results", fixed = TRUE)
+  expect_error(launcher$terminate_orphans(), "could not list the remote workers", fixed = TRUE)
+})
+
+test_that("verbose = TRUE reports the tunnel and each launch", {
+  skip_without_fake_ssh()
+  controller <- fake_controller(remote_tempdir(), verbose = TRUE)
+  on.exit(controller$terminate())
+  messages <- testthat::capture_messages(controller$start())
+  expect_match(messages[1L], "^crew.ssh: opening tunnel: ")
+  expect_match(messages[2L], "^crew.ssh: tunnel open, remote workers will dial tcp://127.0.0.1:")
+  expect_message(
+    controller$launcher$launch_worker(controller$launcher$call()),
+    "^crew.ssh: launching worker-[0-9a-f]+, log at "
+  )
+})
+
+test_that("a launch that fails on the remote system fails loudly", {
+  skip_without_fake_ssh()
+  # A host that opens the tunnel but cannot start workers, as when the remote
+  # directory is not writable.
+  broken <- write_executable(
+    c(
+      fake_ssh_lines[-length(fake_ssh_lines)],
+      "case \"$1\" in *nohup*) echo 'mkdir: Permission denied' >&2; exit 1 ;; esac",
+      "exec sh -c \"$1\""
+    )
+  )
+  controller <- fake_controller(remote_tempdir())
+  private <- controller$launcher$.__enclos_env__$private
+  private$.ssh_command <- broken
+  on.exit(controller$terminate())
+  controller$start()
+  expect_error(
+    controller$launcher$launch_worker(controller$launcher$call()),
+    paste0(
+      "Could not launch a crew worker on fakehost. ssh exited with status 1.\n",
+      "stdout: \nstderr: mkdir: Permission denied"
+    ),
+    fixed = TRUE
+  )
+})
+
+test_that("draining a tunnel that is not open does nothing", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com"
+  )$launcher$.__enclos_env__$private
+  expect_null(private$tunnel_drain())
+  expect_identical(private$.tunnel_output, character(0L))
+})
+
+test_that("a deletion that hangs is stopped when the launcher terminates", {
+  skip_without_fake_ssh()
+  launcher <- salvage_launcher()
+  private <- launcher$.__enclos_env__$private
+  private$.seconds_timeout <- 0.5
+  private$.ssh_command <- write_executable(c("#!/bin/sh", "sleep 30"))
+  private$.salvage_pending <- "/remote/a.rds"
+  private$salvage_flush(wait = FALSE)
+  hung <- private$.salvage_cleanup
+  expect_warning(
+    private$salvage_flush(wait = TRUE),
+    "crew.ssh could not delete 1 collected result(s)",
+    fixed = TRUE
+  )
+  expect_false(hung$is_alive())
+  expect_null(private$.salvage_cleanup)
 })
 
 # Live tests ----
@@ -353,4 +1343,139 @@ test_that("an unreachable host fails loudly instead of hanging", {
     seconds_timeout = 30
   )
   expect_error(controller$start(), class = "crew_error")
+})
+
+test_that("a container worker is stopped through its runtime, even without --init", {
+  image <- skip_without_docker()
+  remote <- remote_tempdir()
+  started <- file.path(remote, "started")
+  # Without --init, R is the container's first process and ignores the
+  # SIGTERM that reaches it through the runtime's client.
+  controller <- fake_controller(
+    remote,
+    launch_prefix = docker_prefix(image, remote, init = FALSE),
+    rscript = "Rscript",
+    seconds_launch = 300
+  )
+  on.exit(controller$terminate())
+  controller$start()
+  controller$push(
+    command = {
+      file.create(started)
+      Sys.sleep(300)
+    },
+    data = list(started = started)
+  )
+  wait_until(
+    {
+      controller$scale()
+      file.exists(started)
+    },
+    seconds = 300
+  )
+  cid <- container_ids(remote)
+  expect_length(cid, 1L)
+  expect_true(container_running(cid))
+  workers <- controller$launcher$remote_workers()
+  expect_identical(workers$container, cid)
+  expect_identical(workers$runtime, "docker")
+  expect_true(workers$alive)
+  controller$terminate()
+  wait_until(!container_running(cid), seconds = 60)
+})
+
+test_that("a container worker that loses its session finishes, saves, and exits", {
+  image <- skip_without_docker()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  # This is the configuration of the incident behind salvage: no --init.
+  prefix <- docker_prefix(image, remote, init = FALSE)
+  session <- session_in_background(
+    remote,
+    command = counted_task(seconds = 8),
+    data = list(counter = counter),
+    name = "slow",
+    launch_prefix = prefix,
+    rscript = "Rscript"
+  )
+  on.exit(session$kill())
+  wait_until(file.exists(counter), seconds = 300)
+  cid <- container_ids(remote)
+  session$kill()
+  wait_until(
+    length(list.files(file.path(remote, "crew-ssh-salvage"), "^slow-.*\\.rds$")) == 1L,
+    seconds = 60
+  )
+  wait_until(!container_running(cid), seconds = 60)
+  controller <- fake_controller(
+    remote,
+    salvage = TRUE,
+    launch_prefix = prefix,
+    rscript = "Rscript",
+    seconds_launch = 300
+  )
+  on.exit(controller$terminate(), add = TRUE)
+  controller$start()
+  controller$push(
+    command = counted_task(seconds = 8),
+    data = list(counter = counter),
+    name = "slow",
+    substitute = FALSE
+  )
+  controller$wait(mode = "all", seconds_timeout = 300)
+  expect_identical(controller$pop()$result[[1L]], 42L)
+  expect_identical(count_runs(counter), 1L)
+})
+
+test_that("a container worker still running is waited for by a reconnecting session", {
+  image <- skip_without_docker()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  prefix <- docker_prefix(image, remote, init = FALSE)
+  session <- session_in_background(
+    remote,
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow",
+    launch_prefix = prefix,
+    rscript = "Rscript"
+  )
+  on.exit(session$kill())
+  wait_until(file.exists(counter), seconds = 300)
+  cid <- container_ids(remote)
+  session$kill()
+  controller <- fake_controller(
+    remote,
+    salvage = TRUE,
+    launch_prefix = prefix,
+    rscript = "Rscript",
+    seconds_launch = 300
+  )
+  on.exit(controller$terminate(), add = TRUE)
+  controller$start()
+  controller$push(
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow",
+    substitute = FALSE
+  )
+  wait_until(
+    {
+      controller$scale()
+      identical(sort(unname(task_states(remote))), c("running", "waiting"))
+    },
+    seconds = 300
+  )
+  # The old container is still computing for a session that no longer exists.
+  expect_true(container_running(cid))
+  workers <- controller$launcher$remote_workers()
+  expect_identical(sum(workers$alive), 2L)
+  file.create(release)
+  controller$wait(mode = "all", seconds_timeout = 300)
+  expect_identical(controller$pop()$result[[1L]], 42L)
+  expect_identical(count_runs(counter), 1L)
+  wait_until(!container_running(cid), seconds = 60)
 })
