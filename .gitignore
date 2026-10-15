@@ -3,3 +3,5 @@
 /local-testing.R
 inst/examples/_targets/
 .claude/
+*.Rcheck/
+*.tar.gz
