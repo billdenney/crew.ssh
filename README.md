@@ -140,11 +140,17 @@ by this one retrying a task whose worker was cut off, there are two cases:
   old worker as `"running"` and the new one as `"waiting"`. If the old worker
   dies without finishing (killed, container stopped, machine restarted), its
   heartbeat stops, and after two minutes the new worker takes over and runs
-  the task itself.
+  the task itself. If the new worker's own session then loses its connection,
+  the next session to connect stops the waiter, which could no longer hand
+  anything back; the old worker still saves its result.
 
 With `targets`, this means re-running `tar_make()` after a dropped connection
 picks up the remote targets that were in flight, finished or still running,
-instead of starting them over.
+instead of starting them over. `targets` decides when they come up, but until
+then their old workers count against `workers`, so the remote machine never
+runs more tasks at once than `workers`. If the network is still down when
+`crew.ssh` reopens its tunnel or launches a worker, it keeps trying for up to
+`seconds_reconnect` (an hour by default) instead of stopping the pipeline.
 
 A task is matched by its name and by everything it computes from, so a target
 whose code or data changed in between runs again. A saved error is never

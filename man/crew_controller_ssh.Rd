@@ -16,6 +16,7 @@ crew_controller_ssh(
   remote_directory = "/tmp",
   salvage = TRUE,
   salvage_directory = NULL,
+  seconds_reconnect = 3600,
   verbose = FALSE,
   name = NULL,
   workers = 1L,
@@ -89,6 +90,12 @@ every session. \code{NULL} means the \code{crew-ssh-salvage} subdirectory of
 \code{remote_directory}. \verb{/tmp}, the default \code{remote_directory}, may be
 cleared when the remote system restarts, so choose a durable directory
 for results that must outlast that.}
+
+\item{seconds_reconnect}{Non-negative number of length 1, how long to keep
+trying when the network fails while reopening the tunnel or launching a
+worker, counted in seconds of pauses between attempts. \code{0} gives up at
+the first failure and \code{Inf} never does. See the "Surviving a disconnect"
+section.}
 
 \item{verbose}{Logical of length 1, whether to print messages about the
 tunnel and each worker launch.}
@@ -334,8 +341,30 @@ worker dies without finishing, because it was killed, its container
 was stopped, or the machine restarted, the heartbeat stops, and after
 two minutes the new worker takes over and runs the task itself. While
 this goes on, \code{remote_workers()} shows the old worker as \code{"running"}
-and the new one as \code{"waiting"}.
+and the new one as \code{"waiting"}. A waiting worker whose own session then
+loses its connection can no longer hand the result back, so the next
+session to open a tunnel to the same \code{remote_directory}, or the same
+session when it reconnects, stops it with a message. The worker it
+waited for still saves the result.
+\item A task still running on a worker the controller cannot reach, one of
+a session that is gone or one of this session from before its tunnel
+was reopened, takes up the remote system as much as a connected
+worker does, so it counts against \code{workers} until it finishes: the
+controller launches only as many workers as are left, and says so.
+Once the same task is pushed again, the worker that takes it holds
+the slot instead, while it hands back the saved result or waits for
+the running one. The controller reads the remote records for this at
+most every 30 seconds.
 }
+
+Whether or not salvage is on, a failure of the network while the
+controller reopens its tunnel or launches a worker is retried, with
+pauses that double from about 5 seconds to at most 5 minutes, each
+varied by up to 20\% so that sessions cut off together do not all retry
+at once, until the pauses add up to \code{seconds_reconnect}; only then is it
+an error. Time the local machine spends asleep does not count, so a
+laptop that wakes before its network does carries on once the network is
+back.
 
 A task is identified by its name and by everything it computes from: the
 command, data, globals, seed, and packages, or for a \code{targets} target,

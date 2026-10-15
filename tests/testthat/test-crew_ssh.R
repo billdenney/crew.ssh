@@ -372,6 +372,104 @@ test_that("the salvage arguments are validated", {
   )
 })
 
+test_that("seconds_reconnect is validated", {
+  for (seconds in list(-1, NA_real_, c(1, 2), "60", NULL)) {
+    expect_error(
+      crew_controller_ssh(
+        ssh_host = "user@example.com",
+        seconds_reconnect = seconds
+      ),
+      "seconds_reconnect must be a single non-negative number.",
+      class = "crew_error"
+    )
+  }
+  for (seconds in c(0, 30, Inf)) {
+    controller <- crew_controller_ssh(
+      ssh_host = "user@example.com",
+      seconds_reconnect = seconds
+    )
+    expect_identical(
+      controller$launcher$.__enclos_env__$private$.seconds_reconnect,
+      seconds
+    )
+  }
+  default <- crew_controller_ssh(ssh_host = "user@example.com")
+  expect_identical(
+    default$launcher$.__enclos_env__$private$.seconds_reconnect,
+    3600
+  )
+})
+
+test_that("current_url() points a launch at the tunnel open now", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com"
+  )$launcher$.__enclos_env__$private
+  call <- paste0(
+    "crew::crew_worker(settings = list(url = \"tcp://127.0.0.1:38181\", ",
+    "dispatcher = TRUE), controller = \"x\")"
+  )
+  # Before a tunnel is open there is nothing to point at.
+  expect_identical(private$current_url(call), call)
+  private$.url <- "tcp://127.0.0.1:55365"
+  private$.tunnel_port <- "38479"
+  expect_identical(
+    private$current_url(call),
+    sub("38181", "38479", call, fixed = TRUE)
+  )
+  private$.url <- "tls+tcp://127.0.0.1:55365"
+  tls <- sub("tcp://", "tls+tcp://", call, fixed = TRUE)
+  expect_identical(
+    private$current_url(tls),
+    sub("38181", "38479", tls, fixed = TRUE)
+  )
+})
+
+test_that("pushed_key() finds the key of a pending task by its name", {
+  keys <- new.env(parent = emptyenv())
+  assign("fit", "fit-abc", envir = keys)
+  expect_identical(pushed_key("fit", keys), "fit-abc")
+  expect_identical(pushed_key("other", keys), NA_character_)
+  expect_identical(pushed_key(NA_character_, keys), NA_character_)
+  expect_identical(pushed_key("", keys), NA_character_)
+  expect_identical(pushed_key("fit", NULL), NA_character_)
+})
+
+# reconnect_pause() with the launcher's own first and longest pauses.
+default_pause <- function(tries, jitter, remaining = Inf) {
+  reconnect_pause(
+    tries = tries,
+    remaining = remaining,
+    first = 5,
+    longest = 300,
+    jitter = jitter
+  )
+}
+
+test_that("reconnect pauses double up to five minutes, with jitter of 20%", {
+  # With the jitter in the middle, the pauses are the plain doubling.
+  expect_identical(
+    vapply(1:9, default_pause, numeric(1L), jitter = 0.5),
+    c(5, 10, 20, 40, 80, 160, 300, 300, 300)
+  )
+  # Jitter spreads a pause over 80% to 120% of it.
+  expect_equal(default_pause(1L, jitter = 0), 4)
+  expect_equal(default_pause(3L, jitter = 0.75), 22)
+  expect_equal(default_pause(7L, jitter = 0), 240)
+  # The longest pause stays the longest, whatever the jitter.
+  expect_identical(default_pause(7L, jitter = 0.999), 300)
+  expect_identical(default_pause(20L, jitter = 0.999), 300)
+  # And no pause outlasts what is left of seconds_reconnect.
+  expect_identical(default_pause(5L, jitter = 0.5, remaining = 12), 12)
+  expect_identical(default_pause(1L, jitter = 0.999, remaining = 3), 3)
+  # The launcher's defaults are the ones tested here.
+  expect_identical(
+    crew_controller_ssh(
+      ssh_host = "user@example.com"
+    )$launcher$.__enclos_env__$private$.reconnect_pauses,
+    c(first = 5, longest = 300)
+  )
+})
+
 test_that("salvage is on unless it is turned off", {
   private <- crew_controller_ssh(
     ssh_host = "user@example.com"
@@ -448,6 +546,31 @@ test_that("the tunnel command records the session and then waits on stdin", {
   expect_match(
     private$tunnel_command(),
     "^mkdir -p '/tmp/crew-ssh-abc' '/tmp/crew-ssh-salvage' && "
+  )
+})
+
+test_that("with salvage, the tunnel command stops stranded waiters before recording itself", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    name = "ctl",
+    remote_directory = "/scratch"
+  )$launcher$.__enclos_env__$private
+  private$.session <- "crew-ssh-abc"
+  private$.session_directory <- "/scratch/crew-ssh-abc"
+  expect_identical(
+    private$tunnel_command(),
+    paste0(
+      "mkdir -p '/scratch/crew-ssh-abc' '/scratch/crew-ssh-salvage' && {\n",
+      remote_stop_waiters_script("/scratch", session = "crew-ssh-abc"),
+      "\n:; } && ",
+      "printf '%s\\n' 'session: crew-ssh-abc' 'controller: ctl' ",
+      "'runtime: ' 'local_host: ", Sys.info()[["nodename"]], "' ",
+      "'local_pid: ", Sys.getpid(), "' \"started: $(date +%s)\" > ",
+      "'/scratch/crew-ssh-abc/session.dcf' && ",
+      "echo $$ > '/scratch/crew-ssh-abc/tunnel.pid' && ",
+      "echo crew-ssh-tunnel-ready && ",
+      "exec sh -c 'cat > /dev/null; :' 'crew-ssh-abc'"
+    )
   )
 })
 
@@ -813,6 +936,142 @@ test_that("a tunnel that dropped is reopened at the next launch", {
   expect_true(private$.tunnel$is_alive())
 })
 
+# A stand-in for ssh that fails the way ssh does while the network is down,
+# with exit status 255, as many times as the number in the file `failures`
+# says, counting it down, and then behaves like fake_ssh().
+flaky_ssh <- function(failures) {
+  path <- shQuote(failures, type = "sh")
+  write_executable(
+    c(
+      "#!/bin/sh",
+      paste0("n=$(cat ", path, " 2>/dev/null || echo 0)"),
+      "if [ \"$n\" -gt 0 ]; then",
+      paste0("  echo $((n - 1)) > ", path),
+      "  echo 'ssh: Could not resolve hostname fakehost: Name or service not known' >&2",
+      "  exit 255",
+      "fi",
+      fake_ssh_lines[-1L]
+    )
+  )
+}
+
+test_that("a tunnel that cannot be reopened yet is tried again until the network is back", {
+  skip_without_fake_ssh()
+  failures <- tempfile()
+  controller <- fake_controller(remote_tempdir(), salvage = FALSE)
+  on.exit(controller$terminate())
+  private <- controller$launcher$.__enclos_env__$private
+  private$.ssh_command <- flaky_ssh(failures)
+  private$.reconnect_pauses <- c(first = 0.1, longest = 0.2)
+  controller$start()
+  tools::pskill(private$.tunnel$get_pid())
+  wait_until(!private$.tunnel$is_alive(), seconds = 10)
+  writeLines("2", failures)
+  messages <- capture_messages({
+    controller$push(command = 6L * 7L)
+    controller$wait(mode = "all", seconds_timeout = 60)
+  })
+  expect_identical(
+    sum(
+      grepl(
+        paste0(
+          "crew.ssh: could not reopen the ssh tunnel to fakehost (The ssh ",
+          "tunnel exited before it was ready. ssh output: ssh: Could not ",
+          "resolve hostname fakehost: Name or service not known). Trying ",
+          "again in "
+        ),
+        messages,
+        fixed = TRUE
+      )
+    ),
+    2L
+  )
+  expect_true(
+    any(
+      grepl(
+        "crew.ssh: managed to reopen the ssh tunnel to fakehost at attempt 3.",
+        messages,
+        fixed = TRUE
+      )
+    )
+  )
+  expect_identical(readLines(failures), "0")
+  expect_true(private$.tunnel$is_alive())
+  expect_identical(controller$pop()$result[[1L]], 42L)
+})
+
+test_that("seconds_reconnect = 0 gives up at the first failure", {
+  skip_without_fake_ssh()
+  failures <- tempfile()
+  controller <- fake_controller(
+    remote_tempdir(),
+    salvage = FALSE,
+    seconds_reconnect = 0
+  )
+  on.exit(controller$terminate())
+  private <- controller$launcher$.__enclos_env__$private
+  private$.ssh_command <- flaky_ssh(failures)
+  controller$start()
+  tools::pskill(private$.tunnel$get_pid())
+  wait_until(!private$.tunnel$is_alive(), seconds = 10)
+  writeLines("5", failures)
+  expect_error(
+    suppressMessages(
+      controller$launcher$launch_worker(controller$launcher$call())
+    ),
+    paste0(
+      "crew.ssh could not reopen the ssh tunnel to fakehost in 1 attempt(s) ",
+      "over 0 seconds of retrying (seconds_reconnect = 0). Last failure: ",
+      "The ssh tunnel exited before it was ready. ssh output: ",
+      "ssh: Could not resolve hostname fakehost: Name or service not known"
+    ),
+    fixed = TRUE
+  )
+  expect_identical(readLines(failures), "4")
+})
+
+test_that("a launch that fails on the network is tried again", {
+  skip_without_fake_ssh()
+  failures <- tempfile()
+  controller <- fake_controller(remote_tempdir(), salvage = FALSE)
+  on.exit(controller$terminate())
+  private <- controller$launcher$.__enclos_env__$private
+  private$.ssh_command <- flaky_ssh(failures)
+  private$.reconnect_pauses <- c(first = 0.1, longest = 0.2)
+  controller$start()
+  writeLines("2", failures)
+  messages <- capture_messages({
+    controller$push(command = 6L * 7L)
+    controller$wait(mode = "all", seconds_timeout = 60)
+  })
+  expect_identical(
+    sum(
+      grepl(
+        paste0(
+          "crew.ssh: could not launch a worker on fakehost (ssh exited with ",
+          "status 255. stdout: stderr: ssh: Could not resolve hostname ",
+          "fakehost: Name or service not known). Trying again in "
+        ),
+        messages,
+        fixed = TRUE
+      )
+    ),
+    2L
+  )
+  expect_true(
+    any(
+      grepl(
+        "crew.ssh: managed to launch a worker on fakehost at attempt 3.",
+        messages,
+        fixed = TRUE
+      )
+    )
+  )
+  expect_identical(readLines(failures), "0")
+  expect_length(private$.handles, 1L)
+  expect_identical(controller$pop()$result[[1L]], 42L)
+})
+
 test_that("a saved result lives until its task is collected", {
   skip_without_fake_ssh()
   remote <- remote_tempdir()
@@ -1065,6 +1324,111 @@ test_that("a reconnecting session waits for a task still running, then collects 
   controller$terminate()
   expect_identical(list.files(file.path(remote, "crew-ssh-salvage")), character(0L))
   wait_until(!pid_alive(worker_pid(remote, old)), seconds = 30)
+})
+
+test_that("a task left running by a dead session counts against workers", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  session <- session_in_background(
+    remote,
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow"
+  )
+  on.exit(session$kill())
+  wait_until(file.exists(counter))
+  session$kill()
+  old <- other_session(remote, current = NULL)
+  tunnel <- readLines(file.path(remote, old, "tunnel.pid"))
+  wait_until(!pid_alive(tunnel), seconds = 30)
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  private <- controller$launcher$.__enclos_env__$private
+  private$.unreachable_seconds <- 0.5
+  controller$start()
+  expect_message(
+    {
+      controller$push(command = 6L * 7L, name = "quick")
+      controller$wait(mode = "all", seconds_timeout = 3)
+    },
+    paste0(
+      "1 task(s) are still running on workers of fakehost that this ",
+      "controller cannot reach (slow). Until they finish or this controller ",
+      "pushes them again, they count against its 1 worker(s), so it ",
+      "launches at most 0."
+    ),
+    fixed = TRUE
+  )
+  # The old worker holds the only slot, so nothing launched.
+  expect_length(private$.handles, 0L)
+  expect_identical(controller$unresolved(), 1L)
+  file.create(release)
+  expect_message(
+    controller$wait(mode = "all", seconds_timeout = 120),
+    "no tasks are running on unreachable workers of fakehost any more",
+    fixed = TRUE
+  )
+  expect_identical(controller$pop()$result[[1L]], 42L)
+  expect_length(private$.handles, 1L)
+  # Pushed again, the slow task hands back what the old worker saved.
+  controller$push(
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow",
+    substitute = FALSE
+  )
+  controller$wait(mode = "all", seconds_timeout = 60)
+  expect_identical(controller$pop()$result[[1L]], 42L)
+  expect_identical(count_runs(counter), 1L)
+})
+
+test_that("a task pushed again holds the slot its old worker counted against", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  session <- session_in_background(
+    remote,
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow"
+  )
+  on.exit(session$kill())
+  wait_until(file.exists(counter))
+  session$kill()
+  old <- other_session(remote, current = NULL)
+  tunnel <- readLines(file.path(remote, old, "tunnel.pid"))
+  wait_until(!pid_alive(tunnel), seconds = 30)
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  controller$start()
+  controller$push(
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow",
+    substitute = FALSE
+  )
+  # The worker that takes the task is the slot, so with one worker it still
+  # launches, attaches, and waits instead of starting a second run.
+  wait_until(
+    {
+      controller$scale()
+      identical(sort(unname(task_states(remote))), c("running", "waiting"))
+    },
+    seconds = 120
+  )
+  expect_identical(
+    controller$launcher$.__enclos_env__$private$unreachable_unpushed(),
+    0L
+  )
+  file.create(release)
+  controller$wait(mode = "all", seconds_timeout = 120)
+  expect_identical(controller$pop()$result[[1L]], 42L)
+  expect_identical(count_runs(counter), 1L)
 })
 
 test_that("a task whose worker was killed outright is run again once its lock goes quiet", {

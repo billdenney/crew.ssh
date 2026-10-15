@@ -17,8 +17,25 @@
 # and the container runtime on the remote system, so the scripts use POSIX sh
 # and not R.
 
-remote_workers_script <- function(remote_directory) {
-  paste(
+#
+# `states`, when given, limits the workers to those whose latest task is in one
+# of these states, and skips the others before the process and container
+# checks, which over many old sessions are what take the time.
+remote_workers_script <- function(remote_directory, states = NULL) {
+  filter <- if (is.null(states)) {
+    character(0L)
+  } else {
+    c(
+      "    st=",
+      "    [ -s \"$d$w.task\" ] && st=$(sed -n 's/^task_state: //p' \"$d$w.task\")",
+      paste0(
+        "    case \"$st\" in ",
+        paste(shQuote(states, type = "sh"), collapse = "|"),
+        ") ;; *) continue ;; esac"
+      )
+    )
+  }
+  lines <- c(
     paste0(
       "for d in ", shQuote(remote_directory, type = "sh"), "/crew-ssh-*/; do"
     ),
@@ -37,6 +54,7 @@ remote_workers_script <- function(remote_directory) {
     "  for p in \"$d\"worker-*.pid; do",
     "    [ -f \"$p\" ] || continue",
     "    w=$(basename \"$p\" .pid)",
+    filter,
     "    pid=$(cat \"$p\")",
     "    alive=FALSE",
     "    case \"$(ps -p \"$pid\" -o args= 2>/dev/null)\" in",
@@ -58,9 +76,9 @@ remote_workers_script <- function(remote_directory) {
     "    echo",
     "  done",
     "done",
-    "exit 0",
-    sep = "\n"
+    "exit 0"
   )
+  paste(lines, collapse = "\n")
 }
 
 remote_salvage_script <- function(directory) {
@@ -112,6 +130,17 @@ remote_stop_script <- function(pids, sessions, cid_files, runtimes) {
     shQuote(runtimes, type = "sh")
   )
   paste(
+    remote_stop_function(),
+    paste(calls, collapse = "\n"),
+    "exit 0",
+    sep = "\n"
+  )
+}
+
+# crew_ssh_stop PID SESSION CID_FILE RUNTIME, as remote_stop_script() and
+# remote_stop_waiters_script() use it.
+remote_stop_function <- function() {
+  paste(
     "crew_ssh_stop() {",
     "  case \"$(ps -p \"$1\" -o args= 2>/dev/null)\" in",
     "    *\"$2\"*) kill \"$1\" 2>/dev/null ;;",
@@ -121,10 +150,98 @@ remote_stop_script <- function(pids, sessions, cid_files, runtimes) {
     "  fi",
     "  return 0",
     "}",
-    paste(calls, collapse = "\n"),
-    "exit 0",
     sep = "\n"
   )
+}
+
+# Stop the workers that wait, under salvage, for a task another worker is
+# running, once the tunnel of their own session is gone. Such a worker can no
+# longer hand a result back, and the worker it waits for saves the result
+# itself, so the waiter only holds a container and its memory until that task
+# ends, which can be hours.
+#
+# This runs in the tunnel command of every session start and reconnect, before
+# the session records its new tunnel, so it sees only tunnels opened earlier.
+# `session` names the session opening the tunnel: when it reconnects, its own
+# waiters lost their connection with the old tunnel, even while the remote end
+# of that tunnel lingers because sshd has not yet noticed the client is gone.
+# A worker's task file is read just before the stop, so a waiter that has
+# since taken the task over is left running. Each stopped worker is reported on
+# a line beginning "crew-ssh-stopped-waiter:".
+remote_stop_waiters_script <- function(remote_directory, session) {
+  paste(
+    remote_stop_function(),
+    paste0("current=", shQuote(session, type = "sh")),
+    paste0(
+      "for d in ", shQuote(remote_directory, type = "sh"), "/crew-ssh-*/; do"
+    ),
+    "  [ -d \"$d\" ] || continue",
+    "  s=$(basename \"$d\")",
+    "  if [ \"$s\" != \"$current\" ] && [ -s \"${d}tunnel.pid\" ]; then",
+    "    case \"$(ps -p \"$(cat \"${d}tunnel.pid\")\" -o args= 2>/dev/null)\" in",
+    "      *\"$s\"*) continue ;;",
+    "    esac",
+    "  fi",
+    "  rt=",
+    "  if [ -f \"${d}session.dcf\" ]; then",
+    "    rt=$(sed -n 's/^runtime: //p' \"${d}session.dcf\")",
+    "  fi",
+    "  for t in \"$d\"worker-*.task; do",
+    "    [ -f \"$t\" ] || continue",
+    "    grep -qx 'task_state: waiting' \"$t\" || continue",
+    "    w=$(basename \"$t\" .task)",
+    "    pid=",
+    "    [ -s \"$d$w.pid\" ] && pid=$(cat \"$d$w.pid\")",
+    "    alive=",
+    "    case \"$(ps -p \"$pid\" -o args= 2>/dev/null)\" in",
+    "      *\"$s\"*) alive=TRUE ;;",
+    "    esac",
+    "    if [ -n \"$rt\" ] && [ -s \"$d$w.cid\" ]; then",
+    "      r=$(\"$rt\" inspect --format '{{.State.Running}}' \\",
+    "        \"$(cat \"$d$w.cid\")\" 2>/dev/null) && [ \"$r\" = true ] && alive=TRUE",
+    "    fi",
+    "    [ -n \"$alive\" ] || continue",
+    "    crew_ssh_stop \"$pid\" \"$s\" \"$d$w.cid\" \"$rt\"",
+    "    printf 'crew-ssh-stopped-waiter: %s %s %s\\n' \"$s\" \"$w\" \\",
+    "      \"$(sed -n 's/^task_name: //p' \"$t\")\"",
+    "  done",
+    "done",
+    sep = "\n"
+  )
+}
+
+# The tasks still running on workers the controller cannot reach, as a data
+# frame of their `task_key` and `task_name`: tasks of workers of other
+# sessions whose tunnel is gone, and of this session's workers named in
+# `disconnected`, which it launched before its tunnel was last reopened.
+# `workers` is a remote_workers_frame().
+remote_unreachable_tasks <- function(workers, disconnected) {
+  cut_off <- ifelse(
+    workers$current,
+    workers$worker %in% disconnected,
+    !workers$session_alive
+  )
+  running <- workers$alive &
+    workers$task_state %in% "running" &
+    !is.na(workers$task_key) &
+    cut_off
+  out <- workers[running, c("task_key", "task_name"), drop = FALSE]
+  out <- out[!duplicated(out$task_key), , drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
+# The workers remote_stop_waiters_script() reports in `output`, each as
+# "<worker> of <session> (<task>)", or without the task when its record
+# names none.
+remote_stopped_waiters <- function(output) {
+  pattern <- "^crew-ssh-stopped-waiter: (\\S+) (\\S+) ?(.*)$"
+  lines <- grep(pattern, trimws(output), value = TRUE, perl = TRUE)
+  labels <- sub(pattern, "\\2 of \\1", lines, perl = TRUE)
+  tasks <- sub(pattern, "\\3", lines, perl = TRUE)
+  named <- nzchar(tasks)
+  labels[named] <- paste0(labels[named], " (", tasks[named], ")")
+  labels
 }
 
 remote_dcf <- function(text) {

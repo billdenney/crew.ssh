@@ -335,7 +335,10 @@ worker:
   old worker to finish and hands back that result, rather than starting the
   target a second time. While this goes on, `launcher$remote_workers()` shows
   the old worker's `task_state` as `"running"` and the new one's as
-  `"waiting"`.
+  `"waiting"`. If the session of the waiting worker loses its connection in
+  turn, the waiter can no longer hand anything back, so the next session to
+  connect, or the same one when it reconnects, stops it and says so; the old
+  worker still saves the result.
 * If it died without finishing (it was killed, its container was stopped, or
   the machine restarted), the lock it held goes quiet. A running worker
   touches a heartbeat file every 15 seconds, even while R is busy inside a
@@ -344,6 +347,17 @@ worker:
 
 A target that was computing for 20 hours when the network dropped costs
 nothing more than the wait for the rest of it.
+
+The new session does not choose when the in-flight targets come up: `targets`
+pushes whatever its scheduler reaches first, and it keeps going down a branch
+of the pipeline it has started before it turns to targets waiting for a free
+worker. Meanwhile the old workers are still computing, so they count against
+`workers`: with two old workers still busy and `workers = 2`, the new session
+launches none of its own until one of them finishes, and it says so. Once the
+new session pushes an in-flight target again, the worker that takes it holds
+the slot instead, handing back the saved result at once or waiting for the old
+worker to finish. The remote machine never runs more tasks at once than
+`workers`, and no finished work is computed twice.
 
 Salvage only reuses what would be correct to reuse:
 
@@ -416,11 +430,16 @@ the pipeline needs to live:
 | The same, quick targets with large results, nothing saved on the remote machine | Your machine | `crew_controller_ssh(salvage = FALSE)` |
 | A run that keeps going while you are logged off | The remote machine | `crew_controller_local()`, started under `nohup` or `tmux` |
 
-Brief network interruptions are survivable in the first arrangement: the
-tunnel tolerates roughly 90 seconds of silence, and `crew.ssh` reopens it if it
-does drop, so later workers reconnect without restarting the pipeline. With
-salvage, the workers that were cut off finish and save their targets, and the
-retries of those targets pick the results up.
+Network interruptions are survivable in the first arrangement: the tunnel
+tolerates roughly 90 seconds of silence, and `crew.ssh` reopens it if it does
+drop, so later workers reconnect without restarting the pipeline. If the
+network is still down when it tries, as on a laptop that wakes before its
+Wi-Fi does, it tries again with pauses that double from about 5 seconds to at
+most 5 minutes, each varied by up to 20%, until the pauses add up to
+`seconds_reconnect` (an hour by default); time the laptop spends asleep does
+not count. With salvage, the workers that were cut off
+finish and save their targets, and the retries of those targets pick the
+results up.
 
 Salvage keeps each result on the remote machine until a session collects it,
 so with `salvage = FALSE` for targets that return a lot of data and compute

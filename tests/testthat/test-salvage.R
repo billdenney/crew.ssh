@@ -1472,6 +1472,46 @@ test_that("a rerun pipeline waits for the target a dead session left running", {
   expect_identical(count_runs(file.path(project, "fits.txt")), 1L)
 })
 
+test_that("a new session stops the waiter a dead session left behind", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  skip_if_not_installed("targets")
+  project <- remote_tempdir()
+  remote <- file.path(project, "remote")
+  dir.create(remote)
+  write_pipeline(project, remote, multiplier = 2)
+  interrupted_pipeline(project)
+  # The second session attaches to the run the first one left, then dies too.
+  # Its worker keeps waiting with no session to hand the result to.
+  second <- make_pipeline(project, background = TRUE)
+  wait_until("waiting" %in% task_states(remote), seconds = 180)
+  second$kill()
+  states <- task_states(remote)
+  waiter <- names(states)[states == "waiting"]
+  expect_length(waiter, 1L)
+  waiter_pid <- list.files(
+    remote, paste0("^", waiter, "\\.pid$"),
+    recursive = TRUE, full.names = TRUE
+  )
+  session_directory <- dirname(waiter_pid)
+  tunnel <- readLines(file.path(session_directory, "tunnel.pid"))
+  wait_until(!pid_alive(tunnel), seconds = 30)
+  waiter_pid <- readLines(waiter_pid)
+  expect_true(pid_alive(waiter_pid))
+  third <- make_pipeline(project, background = TRUE)
+  on.exit(third$kill())
+  wait_until(!pid_alive(waiter_pid), seconds = 180)
+  # The first session's worker still holds the run and finishes it.
+  expect_true("running" %in% task_states(remote))
+  expect_identical(count_runs(file.path(project, "fits.txt")), 1L)
+  file.create(file.path(project, "release"))
+  wait_until(!third$is_alive(), seconds = 180)
+  expect_identical(third$get_exit_status(), 0L)
+  store <- file.path(project, "_targets")
+  expect_identical(targets::tar_read(fit, store = store), 110)
+  expect_identical(count_runs(file.path(project, "fits.txt")), 1L)
+})
+
 test_that("a target whose code changed runs again instead of reusing", {
   skip_without_fake_ssh()
   skip_if_not_installed("callr")
