@@ -41,8 +41,14 @@ remote_workers_script <- function(remote_directory, states = NULL) {
     ),
     "  s=$(basename \"$d\")",
     "  rt=",
+    "  lh=",
+    "  lp=",
+    "  lc=",
     "  if [ -f \"${d}session.dcf\" ]; then",
     "    rt=$(sed -n 's/^runtime: //p' \"${d}session.dcf\")",
+    "    lh=$(sed -n 's/^local_host: //p' \"${d}session.dcf\")",
+    "    lp=$(sed -n 's/^local_pid: //p' \"${d}session.dcf\")",
+    "    lc=$(sed -n 's/^local_created: //p' \"${d}session.dcf\")",
     "  fi",
     "  sa=FALSE",
     "  if [ -s \"${d}tunnel.pid\" ]; then",
@@ -68,6 +74,8 @@ remote_workers_script <- function(remote_directory, states = NULL) {
     "        \"$cid\" 2>/dev/null) || running=false",
     "    fi",
     "    printf 'session: %s\\nsession_alive: %s\\n' \"$s\" \"$sa\"",
+    "    printf 'local_host: %s\\nlocal_pid: %s\\nlocal_created: %s\\n' \\",
+    "      \"$lh\" \"$lp\" \"$lc\"",
     "    printf 'worker: %s\\npid: %s\\nprocess_alive: %s\\n' \\",
     "      \"$w\" \"$pid\" \"$alive\"",
     "    printf 'container: %s\\ncontainer_running: %s\\nruntime: %s\\n' \\",
@@ -168,16 +176,35 @@ remote_stop_function <- function() {
 # A worker's task file is read just before the stop, so a waiter that has
 # since taken the task over is left running. Each stopped worker is reported on
 # a line beginning "crew-ssh-stopped-waiter:".
-remote_stop_waiters_script <- function(remote_directory, session) {
+#
+# `dead` names sessions the controller knows have ended, because they were
+# started on its own machine by an R process that is no longer running (see
+# local_session_alive()). sshd can keep the remote end of such a session's
+# tunnel for hours after its client is gone, which would make the session
+# look connected, so for these the tunnel is not consulted: their waiters are
+# stopped, and the lingering end of their tunnel is closed and reported on a
+# line beginning "crew-ssh-closed-tunnel:".
+remote_stop_waiters_script <- function(remote_directory, session,
+                                       dead = character(0L)) {
   paste(
     remote_stop_function(),
     paste0("current=", shQuote(session, type = "sh")),
+    paste0("dead=", shQuote(paste(dead, collapse = " "), type = "sh")),
     paste0(
       "for d in ", shQuote(remote_directory, type = "sh"), "/crew-ssh-*/; do"
     ),
     "  [ -d \"$d\" ] || continue",
     "  s=$(basename \"$d\")",
-    "  if [ \"$s\" != \"$current\" ] && [ -s \"${d}tunnel.pid\" ]; then",
+    "  ended=",
+    "  case \" $dead \" in *\" $s \"*) ended=TRUE ;; esac",
+    "  if [ -n \"$ended\" ] && [ -s \"${d}tunnel.pid\" ]; then",
+    "    tp=$(cat \"${d}tunnel.pid\")",
+    "    case \"$(ps -p \"$tp\" -o args= 2>/dev/null)\" in",
+    "      *\"$s\"*) kill \"$tp\" 2>/dev/null &&",
+    "        printf 'crew-ssh-closed-tunnel: %s\\n' \"$s\" ;;",
+    "    esac",
+    "  fi",
+    "  if [ \"$s\" != \"$current\" ] && [ -z \"$ended\" ] && [ -s \"${d}tunnel.pid\" ]; then",
     "    case \"$(ps -p \"$(cat \"${d}tunnel.pid\")\" -o args= 2>/dev/null)\" in",
     "      *\"$s\"*) continue ;;",
     "    esac",
@@ -244,6 +271,89 @@ remote_stopped_waiters <- function(output) {
   labels
 }
 
+# The sessions whose lingering tunnel end remote_stop_waiters_script()
+# reports closing in `output`.
+remote_closed_tunnels <- function(output) {
+  pattern <- "^crew-ssh-closed-tunnel: (\\S+)$"
+  lines <- grep(pattern, trimws(output), value = TRUE, perl = TRUE)
+  sub(pattern, "\\1", lines, perl = TRUE)
+}
+
+# The record of every session under `remote_directory`, as written by its
+# tunnel command, one DCF record per session.
+remote_sessions_script <- function(remote_directory) {
+  paste(
+    paste0(
+      "for d in ", shQuote(remote_directory, type = "sh"), "/crew-ssh-*/; do"
+    ),
+    "  [ -s \"${d}session.dcf\" ] || continue",
+    "  cat \"${d}session.dcf\"",
+    "  echo",
+    "done",
+    "exit 0",
+    sep = "\n"
+  )
+}
+
+# The sessions in remote_sessions_script() output `text` that were started on
+# this machine by an R process that has ended, other than `current`.
+remote_dead_sessions <- function(text, current,
+                                 nodename = Sys.info()[["nodename"]]) {
+  records <- remote_dcf(text)
+  rows <- if (is.null(records)) 0L else nrow(records)
+  sessions <- remote_field(records, "session", rows)
+  alive <- local_session_alive(
+    local_host = remote_field(records, "local_host", rows),
+    local_pid = as.integer(remote_field(records, "local_pid", rows)),
+    local_created = as.numeric(remote_field(records, "local_created", rows)),
+    nodename = nodename
+  )
+  dead <- sessions[alive %in% FALSE & !is.na(sessions)]
+  setdiff(dead, current)
+}
+
+# Whether the R process that started each session is still running, judged on
+# this machine: TRUE or FALSE for a session started here (`nodename`), and NA
+# for one started on another machine or recorded without its process, which
+# only the remote end of its tunnel can speak for. Host names compare without
+# regard to case, as Windows treats them.
+local_session_alive <- function(local_host, local_pid, local_created,
+                                nodename = Sys.info()[["nodename"]]) {
+  out <- rep(NA, length(local_host))
+  here <- !is.na(local_host) &
+    toupper(local_host) == toupper(nodename) &
+    !is.na(local_pid)
+  if (any(here)) {
+    out[here] <- mapply(
+      local_process_alive,
+      local_pid[here],
+      local_created[here],
+      USE.NAMES = FALSE
+    )
+  }
+  out
+}
+
+# Whether process `pid` is running and is the one created at `created`
+# (seconds since the epoch). The system gives the PID of a process that ended
+# to a later one, whose creation time differs. A record without a creation
+# time, from a session started by an earlier crew.ssh, is judged by its PID
+# alone.
+local_process_alive <- function(pid, created) {
+  handle <- tryCatch(ps::ps_handle(as.integer(pid)), error = identity)
+  if (inherits(handle, "error")) {
+    return(FALSE)
+  }
+  if (is.na(created)) {
+    return(isTRUE(ps::ps_is_running(handle)))
+  }
+  started <- tryCatch(as.numeric(ps::ps_create_time(handle)), error = identity)
+  if (inherits(started, "error")) {
+    return(FALSE)
+  }
+  abs(started - created) < 1
+}
+
 remote_dcf <- function(text) {
   if (!nzchar(trimws(text))) {
     return(NULL)
@@ -287,6 +397,9 @@ remote_workers_frame <- function(text, host, remote_directory, session) {
     alive = process_alive | container_running %in% "true",
     session_alive = remote_field(records, "session_alive", rows) %in% "TRUE",
     current = sessions %in% session,
+    local_host = remote_field(records, "local_host", rows),
+    local_pid = as.integer(remote_field(records, "local_pid", rows)),
+    local_created = as.numeric(remote_field(records, "local_created", rows)),
     task_key = remote_field(records, "task_key", rows),
     task_name = remote_field(records, "task_name", rows),
     task_state = remote_field(records, "task_state", rows),

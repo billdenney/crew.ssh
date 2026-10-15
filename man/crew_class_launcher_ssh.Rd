@@ -331,12 +331,19 @@ without \code{--init}, salvage or not.
 process ID \code{pid} (the client of the container runtime for a container
 worker), the \code{container} ID and \code{runtime}, whether the worker is
 \code{alive}, whether its session is still connected (\code{session_alive}),
-whether the session is this launcher's (\code{current}), and, with
-\code{salvage = TRUE}, the key, name, and state of its latest task with the
-times it started, ended, and was last updated. \code{task_state} is one of
-\code{"running"}, \code{"waiting"} (for a worker of another session running the
-same task), \code{"reused"}, \code{"success"}, \code{"error"}, or \code{"interrupted"}
-(canceled or timed out).
+whether the session is this launcher's (\code{current}), the machine
+(\code{local_host}), process ID (\code{local_pid}), and process creation time
+in seconds since the epoch (\code{local_created}) of the R session that
+started it, and, with \code{salvage = TRUE}, the key, name, and state of
+its latest task with the times it started, ended, and was last
+updated. \code{task_state} is one of \code{"running"}, \code{"waiting"} (for a worker
+of another session running the same task), \code{"reused"}, \code{"success"},
+\code{"error"}, or \code{"interrupted"} (canceled or timed out).
+
+A session counts as connected while the remote end of its tunnel
+runs. The remote \code{sshd} can keep that end for hours after the local
+machine dropped off the network, so a session started on this machine
+whose R process has ended counts as gone whatever the remote end says.
   }
 }
 

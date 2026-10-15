@@ -359,24 +359,26 @@ crew_class_launcher_ssh <- R6::R6Class(
     #'   process ID `pid` (the client of the container runtime for a container
     #'   worker), the `container` ID and `runtime`, whether the worker is
     #'   `alive`, whether its session is still connected (`session_alive`),
-    #'   whether the session is this launcher's (`current`), and, with
-    #'   `salvage = TRUE`, the key, name, and state of its latest task with the
-    #'   times it started, ended, and was last updated. `task_state` is one of
-    #'   `"running"`, `"waiting"` (for a worker of another session running the
-    #'   same task), `"reused"`, `"success"`, `"error"`, or `"interrupted"`
-    #'   (canceled or timed out).
+    #'   whether the session is this launcher's (`current`), the machine
+    #'   (`local_host`), process ID (`local_pid`), and process creation time
+    #'   in seconds since the epoch (`local_created`) of the R session that
+    #'   started it, and, with `salvage = TRUE`, the key, name, and state of
+    #'   its latest task with the times it started, ended, and was last
+    #'   updated. `task_state` is one of `"running"`, `"waiting"` (for a worker
+    #'   of another session running the same task), `"reused"`, `"success"`,
+    #'   `"error"`, or `"interrupted"` (canceled or timed out).
+    #'
+    #'   A session counts as connected while the remote end of its tunnel
+    #'   runs. The remote `sshd` can keep that end for hours after the local
+    #'   machine dropped off the network, so a session started on this machine
+    #'   whose R process has ended counts as gone whatever the remote end says.
     remote_workers = function() {
       out <- private$run(
         command = remote_workers_script(private$.remote_directory),
         timeout = private$.seconds_timeout
       )
       private$assert_remote(out, "list the remote workers")
-      remote_workers_frame(
-        text = out$stdout,
-        host = private$.ssh_host,
-        remote_directory = private$.remote_directory,
-        session = private$.session
-      )
+      private$workers_frame(out$stdout)
     },
     #' @description Stop the workers of other sessions that are still running
     #'   after their session ended or lost its connection.
@@ -783,15 +785,24 @@ crew_class_launcher_ssh <- R6::R6Class(
     #
     # With salvage, the workers left waiting on a task by a session whose
     # tunnel is gone are stopped here too (see remote_stop_waiters_script()),
-    # before tunnel.pid names the new tunnel.
-    tunnel_command = function() {
+    # before tunnel.pid names the new tunnel. `dead` names the sessions known
+    # to have ended although their tunnel's remote end may linger.
+    #
+    # The record names the local R process by its PID and its creation time,
+    # which together tell a later session on this machine whether that
+    # process still runs (see local_session_alive()).
+    tunnel_command = function(dead = character(0L)) {
       directory <- private$.session_directory
       record <- c(
         paste("session:", private$.session),
         paste("controller:", private$.name),
         paste("runtime:", private$runtime_name()),
         paste("local_host:", Sys.info()[["nodename"]]),
-        paste("local_pid:", Sys.getpid())
+        paste("local_pid:", Sys.getpid()),
+        paste(
+          "local_created:",
+          sprintf("%.3f", as.numeric(ps::ps_create_time(ps::ps_handle())))
+        )
       )
       directories <- c(
         directory,
@@ -802,7 +813,8 @@ crew_class_launcher_ssh <- R6::R6Class(
           "{\n",
           remote_stop_waiters_script(
             remote_directory = private$.remote_directory,
-            session = private$.session
+            session = private$.session,
+            dead = dead
           ),
           "\n:; } && "
         )
@@ -822,6 +834,11 @@ crew_class_launcher_ssh <- R6::R6Class(
     },
     tunnel_start = function() {
       parsed <- private$parse_url(private$.url)
+      dead <- if (isTRUE(private$.salvage)) {
+        private$dead_sessions()
+      } else {
+        character(0L)
+      }
       # Remote port 0 asks the remote sshd for any free port and avoids
       # colliding with whatever else is listening there. ssh reports the port
       # it was given on stderr.
@@ -837,7 +854,7 @@ crew_class_launcher_ssh <- R6::R6Class(
         # outright and no R finalizer ever runs. Holding the write end of the
         # ssh process's stdin makes the operating system do it: killing this
         # session closes the pipe, "cat" reads EOF and exits, and ssh follows.
-        private$tunnel_command()
+        private$tunnel_command(dead = dead)
       )
       if (private$.verbose) {
         message(
@@ -895,6 +912,14 @@ crew_class_launcher_ssh <- R6::R6Class(
           "another worker after their own session lost its connection. The ",
           "worker running each task saves its result for the next push. ",
           "Stopped: ", paste(stopped, collapse = ", ")
+        )
+      }
+      closed <- remote_closed_tunnels(private$.tunnel_output)
+      if (length(closed)) {
+        message(
+          "crew.ssh: closed the remote end of the tunnel of ", length(closed),
+          " session(s) on ", private$.ssh_host, " that this machine started ",
+          "and whose R process has ended: ", paste(closed, collapse = ", ")
         )
       }
       if (private$.verbose) {
@@ -1007,6 +1032,38 @@ crew_class_launcher_ssh <- R6::R6Class(
         waited <- waited + pause
       }
     },
+    # The sessions this machine started whose R process has ended, read
+    # before a tunnel opens so its command can treat them as gone. A read that
+    # fails, as when the network is still down, finds none, and the next
+    # tunnel start reads again.
+    dead_sessions = function() {
+      out <- private$run(
+        command = remote_sessions_script(private$.remote_directory),
+        timeout = min(private$.seconds_timeout, private$.unreachable_seconds)
+      )
+      if (!identical(out$status, 0L)) {
+        return(character(0L))
+      }
+      remote_dead_sessions(out$stdout, current = private$.session)
+    },
+    # remote_workers_frame() of `text`, with a session started on this
+    # machine whose R process has ended counted as gone, whatever its
+    # tunnel's remote end says.
+    workers_frame = function(text) {
+      workers <- remote_workers_frame(
+        text = text,
+        host = private$.ssh_host,
+        remote_directory = private$.remote_directory,
+        session = private$.session
+      )
+      local <- local_session_alive(
+        local_host = workers$local_host,
+        local_pid = workers$local_pid,
+        local_created = workers$local_created
+      )
+      workers$session_alive <- workers$session_alive & !(local %in% FALSE)
+      workers
+    },
     tunnel_attempt = function() {
       error <- tryCatch(private$tunnel_start(), error = identity)
       if (inherits(error, "error")) {
@@ -1085,12 +1142,7 @@ crew_class_launcher_ssh <- R6::R6Class(
         if (identical(out$status, 0L)) {
           private$unreachable_update(
             remote_unreachable_tasks(
-              workers = remote_workers_frame(
-                text = out$stdout,
-                host = private$.ssh_host,
-                remote_directory = private$.remote_directory,
-                session = private$.session
-              ),
+              workers = private$workers_frame(out$stdout),
               disconnected = private$.disconnected
             )
           )
@@ -1437,6 +1489,16 @@ crew_class_controller_ssh <- R6::R6Class(
 #'      the slot instead, while it hands back the saved result or waits for
 #'      the running one. The controller reads the remote records for this at
 #'      most every 30 seconds.
+#'
+#'   A session is gone when the remote end of its tunnel has stopped, or,
+#'   for a session started on the same machine, when the R process that
+#'   started it has ended. The second matters after a laptop drops off the
+#'   network: the remote `sshd` can keep the tunnel's remote end for hours,
+#'   which would otherwise make the session look connected. Each session
+#'   records its machine, process ID, and process creation time, so a process
+#'   ID the system has since given to another process does not count. When a
+#'   tunnel opens, the controller also closes the lingering remote ends of the
+#'   sessions it knows have ended, and stops their waiting workers.
 #'
 #'   Whether or not salvage is on, a failure of the network while the
 #'   controller reopens its tunnel or launches a worker is retried, with

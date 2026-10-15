@@ -49,6 +49,8 @@ test_that("remote_workers_frame() types every column, even with no workers", {
       session_directory = "character", worker = "character",
       pid = "integer", container = "character", runtime = "character",
       alive = "logical", session_alive = "logical", current = "logical",
+      local_host = "character", local_pid = "integer",
+      local_created = "numeric",
       task_key = "character", task_name = "character",
       task_state = "character", task_started = "POSIXct",
       task_ended = "POSIXct", task_updated = "POSIXct"
@@ -57,6 +59,9 @@ test_that("remote_workers_frame() types every column, even with no workers", {
   text <- paste(
     "session: crew-ssh-a",
     "session_alive: FALSE",
+    "local_host: LAPTOP",
+    "local_pid: 4567",
+    "local_created: 1790000000.125",
     "worker: worker-1",
     "pid: 123",
     "process_alive: FALSE",
@@ -78,6 +83,9 @@ test_that("remote_workers_frame() types every column, even with no workers", {
   expect_true(frame$alive)
   expect_false(frame$session_alive)
   expect_false(frame$current)
+  expect_identical(frame$local_host, "LAPTOP")
+  expect_identical(frame$local_pid, 4567L)
+  expect_identical(frame$local_created, 1790000000.125)
   expect_identical(as.numeric(frame$task_started), 1790000000.25)
   expect_true(is.na(frame$task_ended))
 })
@@ -412,4 +420,172 @@ test_that("remote_salvage_frame() is empty with typed columns when nothing is sa
   )
   expect_s3_class(frame$modified, "POSIXct")
   expect_identical(frame$path, character(0L))
+})
+
+# The PID and creation time of an R process that ran and has ended.
+ended_r_process <- function() {
+  rscript <- file.path(
+    R.home("bin"),
+    if (.Platform$OS.type == "windows") "Rscript.exe" else "Rscript"
+  )
+  process <- processx::process$new(rscript, c("-e", "Sys.sleep(60)"))
+  out <- list(
+    pid = process$get_pid(),
+    created = as.numeric(ps::ps_create_time(process$as_ps_handle()))
+  )
+  process$kill()
+  process$wait(10000)
+  out
+}
+
+test_that("local_session_alive() tells a running R process from an ended or reused one", {
+  host <- Sys.info()[["nodename"]]
+  me <- Sys.getpid()
+  created <- as.numeric(ps::ps_create_time(ps::ps_handle()))
+  ended <- ended_r_process()
+  expect_identical(
+    local_session_alive(
+      local_host = c(host, tolower(host), host, host, "elsewhere", NA, host),
+      local_pid = c(me, me, me, ended$pid, me, me, NA),
+      local_created = c(
+        created, created, created + 100, ended$created, created, created,
+        created
+      )
+    ),
+    # This process, under any case of its host name; its PID with another
+    # creation time, as when the PID was given to a later process; an ended
+    # process; and three sessions only their tunnel can speak for.
+    c(TRUE, TRUE, FALSE, FALSE, NA, NA, NA)
+  )
+  # A record from an earlier crew.ssh, without a creation time, goes by PID.
+  expect_identical(local_session_alive(host, me, NA_real_), TRUE)
+  expect_identical(
+    local_session_alive(character(0L), integer(0L), numeric(0L)),
+    logical(0L)
+  )
+})
+
+test_that("remote_dead_sessions() names this machine's sessions whose R process ended", {
+  host <- Sys.info()[["nodename"]]
+  created <- sprintf("%.3f", as.numeric(ps::ps_create_time(ps::ps_handle())))
+  ended <- ended_r_process()
+  text <- paste(
+    c(
+      "session: crew-ssh-mine",
+      paste("local_host:", host),
+      paste("local_pid:", Sys.getpid()),
+      paste("local_created:", created),
+      "",
+      "session: crew-ssh-ended",
+      paste("local_host:", tolower(host)),
+      paste("local_pid:", ended$pid),
+      paste("local_created:", sprintf("%.3f", ended$created)),
+      "",
+      "session: crew-ssh-elsewhere",
+      "local_host: another-machine",
+      paste("local_pid:", ended$pid),
+      paste("local_created:", sprintf("%.3f", ended$created)),
+      "",
+      # The session asking is never reported, even with an ended process.
+      "session: crew-ssh-current",
+      paste("local_host:", host),
+      paste("local_pid:", ended$pid),
+      paste("local_created:", sprintf("%.3f", ended$created)),
+      "",
+      "session: crew-ssh-before-local-records",
+      "controller: x"
+    ),
+    collapse = "\n"
+  )
+  expect_identical(
+    remote_dead_sessions(text, current = "crew-ssh-current"),
+    "crew-ssh-ended"
+  )
+  expect_identical(remote_dead_sessions("", current = "x"), character(0L))
+})
+
+test_that("remote_closed_tunnels() reads the sessions whose tunnel end was closed", {
+  output <- c(
+    "crew-ssh-closed-tunnel: crew-ssh-a",
+    "crew-ssh-stopped-waiter: crew-ssh-a worker-1 fit",
+    "  crew-ssh-closed-tunnel: crew-ssh-b  ",
+    "crew-ssh-tunnel-ready"
+  )
+  expect_identical(remote_closed_tunnels(output), c("crew-ssh-a", "crew-ssh-b"))
+  expect_identical(remote_closed_tunnels(character(0L)), character(0L))
+})
+
+test_that("remote_sessions_script() prints the record of every session", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  write_session_records(remote, "crew-ssh-a", 1L)
+  write_session_records(remote, "crew-ssh-b", 2L, runtime = "docker")
+  # A session directory without a record yet is left out.
+  dir.create(file.path(remote, "crew-ssh-c"))
+  dir.create(file.path(remote, "crew-ssh-salvage"))
+  records <- remote_dcf(run_sh(remote_sessions_script(remote)))
+  expect_identical(unname(records[, "session"]), c("crew-ssh-a", "crew-ssh-b"))
+  expect_identical(unname(records[, "runtime"]), c("", "docker"))
+})
+
+test_that("remote_workers_script() reports the local process of each session", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  directory <- file.path(remote, "crew-ssh-a")
+  dir.create(directory)
+  writeLines(
+    c(
+      "session: crew-ssh-a",
+      "local_host: LAPTOP",
+      "local_pid: 4567",
+      "local_created: 1790000000.125"
+    ),
+    file.path(directory, "session.dcf")
+  )
+  writeLines(as.character(Sys.getpid()), file.path(directory, "worker-a.pid"))
+  frame <- remote_workers_frame(
+    run_sh(remote_workers_script(remote)), "host", remote, "crew-ssh-x"
+  )
+  expect_identical(frame$local_host, "LAPTOP")
+  expect_identical(frame$local_pid, 4567L)
+  expect_identical(frame$local_created, 1790000000.125)
+})
+
+test_that("remote_stop_waiters_script() treats sessions known to have ended as gone", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  # The ended session's tunnel end, kept by sshd after its client vanished.
+  lingering <- process_naming("crew-ssh-ended")
+  waiter <- process_naming("crew-ssh-ended")
+  live_tunnel <- process_naming("crew-ssh-live")
+  live_waiter <- process_naming("crew-ssh-live")
+  processes <- list(lingering, waiter, live_tunnel, live_waiter)
+  on.exit(for (process in processes) process$kill())
+  directory <- write_session_records(remote, "crew-ssh-ended", lingering$get_pid())
+  write_worker_records(directory, "worker-w", waiter$get_pid(), "waiting", "fit_e")
+  directory <- write_session_records(remote, "crew-ssh-live", live_tunnel$get_pid())
+  write_worker_records(directory, "worker-w", live_waiter$get_pid(), "waiting", "fit_l")
+  out <- run_sh(
+    paste(
+      remote_stop_waiters_script(
+        remote,
+        session = "crew-ssh-new",
+        dead = "crew-ssh-ended"
+      ),
+      "exit 0",
+      sep = "\n"
+    )
+  )
+  expect_identical(
+    strsplit(out, "\n", fixed = TRUE)[[1L]],
+    c(
+      "crew-ssh-closed-tunnel: crew-ssh-ended",
+      "crew-ssh-stopped-waiter: crew-ssh-ended worker-w fit_e"
+    )
+  )
+  wait_until(!lingering$is_alive(), seconds = 10)
+  wait_until(!waiter$is_alive(), seconds = 10)
+  # A session not known to have ended still goes by its tunnel.
+  expect_true(live_tunnel$is_alive())
+  expect_true(live_waiter$is_alive())
 })
