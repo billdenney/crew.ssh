@@ -359,10 +359,12 @@ most every 30 seconds.
 
 Whether or not salvage is on, a failure of the network while the
 controller reopens its tunnel or launches a worker is retried, with
-pauses that grow from 5 to 30 seconds, until the pauses add up to
-\code{seconds_reconnect}; only then is it an error. Time the local machine
-spends asleep does not count, so a laptop that wakes before its network
-does carries on once the network is back.
+pauses that double from about 5 seconds to at most 5 minutes, each
+varied by up to 20\% so that sessions cut off together do not all retry
+at once, until the pauses add up to \code{seconds_reconnect}; only then is it
+an error. Time the local machine spends asleep does not count, so a
+laptop that wakes before its network does carries on once the network is
+back.
 
 A task is identified by its name and by everything it computes from: the
 command, data, globals, seed, and packages, or for a \code{targets} target,

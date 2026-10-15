@@ -434,6 +434,42 @@ test_that("pushed_key() finds the key of a pending task by its name", {
   expect_identical(pushed_key("fit", NULL), NA_character_)
 })
 
+# reconnect_pause() with the launcher's own first and longest pauses.
+default_pause <- function(tries, jitter, remaining = Inf) {
+  reconnect_pause(
+    tries = tries,
+    remaining = remaining,
+    first = 5,
+    longest = 300,
+    jitter = jitter
+  )
+}
+
+test_that("reconnect pauses double up to five minutes, with jitter of 20%", {
+  # With the jitter in the middle, the pauses are the plain doubling.
+  expect_identical(
+    vapply(1:9, default_pause, numeric(1L), jitter = 0.5),
+    c(5, 10, 20, 40, 80, 160, 300, 300, 300)
+  )
+  # Jitter spreads a pause over 80% to 120% of it.
+  expect_equal(default_pause(1L, jitter = 0), 4)
+  expect_equal(default_pause(3L, jitter = 0.75), 22)
+  expect_equal(default_pause(7L, jitter = 0), 240)
+  # The longest pause stays the longest, whatever the jitter.
+  expect_identical(default_pause(7L, jitter = 0.999), 300)
+  expect_identical(default_pause(20L, jitter = 0.999), 300)
+  # And no pause outlasts what is left of seconds_reconnect.
+  expect_identical(default_pause(5L, jitter = 0.5, remaining = 12), 12)
+  expect_identical(default_pause(1L, jitter = 0.999, remaining = 3), 3)
+  # The launcher's defaults are the ones tested here.
+  expect_identical(
+    crew_controller_ssh(
+      ssh_host = "user@example.com"
+    )$launcher$.__enclos_env__$private$.reconnect_pauses,
+    c(first = 5, longest = 300)
+  )
+})
+
 test_that("salvage is on unless it is turned off", {
   private <- crew_controller_ssh(
     ssh_host = "user@example.com"

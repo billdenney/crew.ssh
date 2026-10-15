@@ -615,8 +615,8 @@ crew_class_launcher_ssh <- R6::R6Class(
     .salvage_directory = NULL,
     .seconds_reconnect = NULL,
     # The first and the longest pause between attempts of retry(), in
-    # seconds; each pause doubles the last.
-    .reconnect_pauses = c(first = 5, longest = 30),
+    # seconds (see reconnect_pause()).
+    .reconnect_pauses = c(first = 5, longest = 300),
     .verbose = NULL,
     .session = NULL,
     .session_directory = NULL,
@@ -992,10 +992,12 @@ crew_class_launcher_ssh <- R6::R6Class(
             private$.seconds_reconnect, "). Last failure: ", failure
           )
         )
-        pause <- min(
-          remaining,
-          private$.reconnect_pauses[["longest"]],
-          private$.reconnect_pauses[["first"]] * 2^(tries - 1L)
+        pause <- reconnect_pause(
+          tries = tries,
+          remaining = remaining,
+          first = private$.reconnect_pauses[["first"]],
+          longest = private$.reconnect_pauses[["longest"]],
+          jitter = as.numeric(Sys.time()) %% 1
         )
         message(
           "crew.ssh: could not ", what, " (", failure, "). Trying again in ",
@@ -1438,10 +1440,12 @@ crew_class_controller_ssh <- R6::R6Class(
 #'
 #'   Whether or not salvage is on, a failure of the network while the
 #'   controller reopens its tunnel or launches a worker is retried, with
-#'   pauses that grow from 5 to 30 seconds, until the pauses add up to
-#'   `seconds_reconnect`; only then is it an error. Time the local machine
-#'   spends asleep does not count, so a laptop that wakes before its network
-#'   does carries on once the network is back.
+#'   pauses that double from about 5 seconds to at most 5 minutes, each
+#'   varied by up to 20% so that sessions cut off together do not all retry
+#'   at once, until the pauses add up to `seconds_reconnect`; only then is it
+#'   an error. Time the local machine spends asleep does not count, so a
+#'   laptop that wakes before its network does carries on once the network is
+#'   back.
 #'
 #'   A task is identified by its name and by everything it computes from: the
 #'   command, data, globals, seed, and packages, or for a `targets` target,
@@ -1617,6 +1621,18 @@ crew_controller_ssh <- function(
 }
 
 # Utilities ----
+
+# The pause before the next try of retry(), after `tries` tries, in seconds:
+# `first` doubled for every try after the first, up to `longest`, then spread
+# over 80% to 120% of that by `jitter`, a number in [0, 1), so that sessions
+# that lost the network together do not all retry at once. It never passes
+# `longest`, or what is `remaining` of seconds_reconnect. retry() takes the
+# jitter from the clock rather than from R's random number generator, which
+# would move the session's random stream.
+reconnect_pause <- function(tries, remaining, first, longest, jitter) {
+  pause <- min(longest, first * 2^(tries - 1L)) * (0.8 + 0.4 * jitter)
+  min(remaining, longest, pause)
+}
 
 # The salvage key under which this session pushed the task called `name` and
 # has not collected it yet, or NA.

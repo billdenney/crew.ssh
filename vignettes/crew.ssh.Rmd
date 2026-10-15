@@ -434,9 +434,10 @@ Network interruptions are survivable in the first arrangement: the tunnel
 tolerates roughly 90 seconds of silence, and `crew.ssh` reopens it if it does
 drop, so later workers reconnect without restarting the pipeline. If the
 network is still down when it tries, as on a laptop that wakes before its
-Wi-Fi does, it tries again with pauses that grow from 5 to 30 seconds, until
-the pauses add up to `seconds_reconnect` (an hour by default); time the laptop
-spends asleep does not count. With salvage, the workers that were cut off
+Wi-Fi does, it tries again with pauses that double from about 5 seconds to at
+most 5 minutes, each varied by up to 20%, until the pauses add up to
+`seconds_reconnect` (an hour by default); time the laptop spends asleep does
+not count. With salvage, the workers that were cut off
 finish and save their targets, and the retries of those targets pick the
 results up.
 
