@@ -497,7 +497,7 @@ test_that("salvage_shipped() ships functions without crew.ssh and the settings",
   expect_setequal(
     names(functions),
     c(
-      "run", "read", "problem", "outcome", "reason", "write", "lock",
+      "run", "reuse", "read", "problem", "outcome", "reason", "write", "lock",
       "lock_age", "lock_owner", "unlock", "heartbeat", "state", "versions",
       "installed_version", "stamp"
     )
@@ -1143,6 +1143,10 @@ test_that("a task another live worker runs is waited for, not run twice", {
   directory <- salvage_tempdir()
   dir.create(directory)
   shipped <- shipped_for(directory)
+  # The saver below is a fresh R process, which can take seconds to start on a
+  # busy machine, so the lock it stands in for must not go stale before it
+  # saves.
+  shipped$seconds_stale <- 60
   expect_true(isTRUE(shipped$lock(file.path(directory, "k-1.lock"), "worker-other", shipped)))
   shipped$heartbeat(file.path(directory, "k-1.lock"), 0.2, 60)
   saver <- callr::r_bg(
@@ -1165,6 +1169,46 @@ test_that("a task another live worker runs is waited for, not run twice", {
     fixed = TRUE
   )
   expect_match(messages[2L], "reuses the result worker worker-other saved", fixed = TRUE)
+})
+
+# A reader that finds nothing on its first call, as when the worker a waiter
+# waits for saves its result just after the waiter's read, and the saved file
+# on every call after that.
+read_late <- function(path, key, salvage) {
+  salvage$read_calls$n <- salvage$read_calls$n + 1L
+  if (identical(salvage$read_calls$n, 1L)) {
+    return(NULL)
+  }
+  salvage$read_saved(path, key, salvage)
+}
+
+test_that("a result saved between a waiter's read and its lock is reused and announced", {
+  local_worker()
+  directory <- salvage_tempdir()
+  dir.create(directory)
+  saveRDS(good_record(value = 99), file.path(directory, "k-1.rds"))
+  shipped <- shipped_for(directory)
+  shipped$read_saved <- shipped$read
+  shipped$read <- read_late
+  shipped$read_calls <- new.env(parent = emptyenv())
+  shipped$read_calls$n <- 0L
+  envir <- counting_envir()
+  messages <- testthat::capture_messages(
+    value <- run_task(shipped, counted, envir)
+  )
+  expect_identical(value, 99)
+  expect_identical(envir$runs, 0L)
+  # The read before the lock missed it, and the read after the lock found it.
+  expect_identical(shipped$read_calls$n, 2L)
+  expect_identical(
+    messages,
+    paste0(
+      "crew.ssh: task k reuses the result worker worker-other saved at ",
+      "2026-10-01 11:00:00 UTC.\n"
+    )
+  )
+  # The lock it took on the way is released.
+  expect_false(dir.exists(file.path(directory, "k-1.lock")))
 })
 
 test_that("a task whose worker went quiet is taken over and run", {
