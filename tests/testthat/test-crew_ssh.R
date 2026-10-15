@@ -639,32 +639,6 @@ test_that("salvage_task() leaves a task alone without salvage or a name", {
   )
 })
 
-# A launcher with salvage whose session is set up without opening a tunnel.
-# The remote system's paths are POSIX paths, which a Windows temporary
-# directory is not, and Windows cannot be the remote system.
-salvage_launcher <- function(remote_directory = remote_tempdir()) {
-  skip_on_os("windows")
-  launcher <- crew_controller_ssh(
-    ssh_host = "fakehost",
-    ssh_command = fake_ssh(),
-    remote_directory = remote_directory,
-    salvage = TRUE
-  )$launcher
-  private <- launcher$.__enclos_env__$private
-  private$.session <- "crew-ssh-abc"
-  private$.session_directory <- file.path(remote_directory, "crew-ssh-abc")
-  private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
-  private$.salvage_collected <- new.env(hash = TRUE, parent = emptyenv())
-  private$.salvage_shipped <- salvage_shipped(
-    directory = private$salvage_root(),
-    session = private$.session,
-    session_directory = private$.session_directory,
-    controller = "ctl",
-    seconds = private$.salvage_seconds
-  )
-  launcher
-}
-
 push_fit <- function(launcher, data = list(x = 1)) {
   launcher$salvage_task(
     command = quote(f(x)),
@@ -935,25 +909,6 @@ test_that("a tunnel that dropped is reopened at the next launch", {
   expect_false(identical(private$.tunnel$get_pid(), old))
   expect_true(private$.tunnel$is_alive())
 })
-
-# A stand-in for ssh that fails the way ssh does while the network is down,
-# with exit status 255, as many times as the number in the file `failures`
-# says, counting it down, and then behaves like fake_ssh().
-flaky_ssh <- function(failures) {
-  path <- shQuote(failures, type = "sh")
-  write_executable(
-    c(
-      "#!/bin/sh",
-      paste0("n=$(cat ", path, " 2>/dev/null || echo 0)"),
-      "if [ \"$n\" -gt 0 ]; then",
-      paste0("  echo $((n - 1)) > ", path),
-      "  echo 'ssh: Could not resolve hostname fakehost: Name or service not known' >&2",
-      "  exit 255",
-      "fi",
-      fake_ssh_lines[-1L]
-    )
-  )
-}
 
 test_that("a tunnel that cannot be reopened yet is tried again until the network is back", {
   skip_without_fake_ssh()

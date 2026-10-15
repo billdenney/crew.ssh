@@ -2,14 +2,14 @@
 # tests run them with sh against real directories and real processes.
 
 skip_without_sh <- function() {
-  skip_on_cran()
-  skip_on_os("windows")
-  skip_if_not_installed("ps")
+  testthat::skip_on_cran()
+  testthat::skip_on_os("windows")
+  testthat::skip_if_not_installed("ps")
 }
 
 run_sh <- function(script) {
   out <- processx::run("sh", c("-c", script), error_on_status = FALSE)
-  expect_identical(out$status, 0L)
+  testthat::expect_identical(out$status, 0L)
   out$stdout
 }
 
@@ -21,20 +21,6 @@ process_naming <- function(session, seconds = 60) {
     "sh",
     c("-c", paste("sleep", seconds, "; :"), session),
     cleanup = TRUE
-  )
-}
-
-# A container runtime that answers `inspect` with a canned state and logs
-# every call.
-fake_runtime <- function(log, running = "true") {
-  write_executable(
-    c(
-      "#!/bin/sh",
-      paste0("echo \"$@\" >> ", shQuote(log, type = "sh")),
-      "case \"$1\" in",
-      paste0("  inspect) echo ", running, " ;;"),
-      "esac"
-    )
   )
 }
 

@@ -309,3 +309,220 @@ fake_docker <- function(log) {
   Sys.chmod(path, mode = "0755")
   path
 }
+
+# The sections below serve one test file each. They live here because lintr
+# checks every file on its own, so a function that calls a helper of this file
+# has to be defined in this file too.
+
+# Remote records ----
+
+# A container runtime that answers `inspect` with a canned state and logs
+# every call.
+fake_runtime <- function(log, running = "true") {
+  write_executable(
+    c(
+      "#!/bin/sh",
+      paste0("echo \"$@\" >> ", shQuote(log, type = "sh")),
+      "case \"$1\" in",
+      paste0("  inspect) echo ", running, " ;;"),
+      "esac"
+    )
+  )
+}
+
+# Launchers ----
+
+# A launcher with salvage whose session is set up without opening a tunnel.
+# The remote system's paths are POSIX paths, which a Windows temporary
+# directory is not, and Windows cannot be the remote system.
+salvage_launcher <- function(remote_directory = remote_tempdir()) {
+  testthat::skip_on_os("windows")
+  launcher <- crew_controller_ssh(
+    ssh_host = "fakehost",
+    ssh_command = fake_ssh(),
+    remote_directory = remote_directory,
+    salvage = TRUE
+  )$launcher
+  private <- launcher$.__enclos_env__$private
+  private$.session <- "crew-ssh-abc"
+  private$.session_directory <- file.path(remote_directory, "crew-ssh-abc")
+  private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
+  private$.salvage_collected <- new.env(hash = TRUE, parent = emptyenv())
+  private$.salvage_shipped <- salvage_shipped(
+    directory = private$salvage_root(),
+    session = private$.session,
+    session_directory = private$.session_directory,
+    controller = "ctl",
+    seconds = private$.salvage_seconds
+  )
+  launcher
+}
+
+# A stand-in for ssh that fails the way ssh does while the network is down,
+# with exit status 255, as many times as the number in the file `failures`
+# says, counting it down, and then behaves like fake_ssh().
+flaky_ssh <- function(failures) {
+  path <- shQuote(failures, type = "sh")
+  write_executable(
+    c(
+      "#!/bin/sh",
+      paste0("n=$(cat ", path, " 2>/dev/null || echo 0)"),
+      "if [ \"$n\" -gt 0 ]; then",
+      paste0("  echo $((n - 1)) > ", path),
+      "  echo 'ssh: Could not resolve hostname fakehost: Name or service not known' >&2",
+      "  exit 255",
+      "fi",
+      fake_ssh_lines[-1L]
+    )
+  )
+}
+
+# Salvage ----
+
+# A payload with every kind of object that hashes by identity, built from the
+# same code in this session and in another one. The closures are made by
+# evaluating code rather than written out, so that each has the environment a
+# real one would: the global environment, or a factory's frame.
+identity_payload <- function() {
+  environment <- new.env()
+  environment$self <- environment
+  environment$value <- 1:3
+  factory <- eval(quote(local({
+    k <- 2
+    function(x) x * k
+  })), envir = globalenv())
+  list(
+    command = quote({
+      fit(data)
+    }),
+    data = list(
+      data = data.frame(x = 1:3),
+      environment = environment,
+      formula = y ~ x,
+      pointer = structure(1:2, selfref = methods::new("externalptr"))
+    ),
+    globals = list(
+      fit = eval(quote(function(data) stats::lm(x ~ 1, data)), envir = globalenv()),
+      factory = factory,
+      sourced = eval(
+        parse(text = "function(x) {\n  x + 1\n}", keep.source = TRUE),
+        envir = globalenv()
+      ),
+      primitive = sum,
+      .Random.seed = sample.int(1000L, 3L)
+    )
+  )
+}
+
+identity_key <- function(source) {
+  if (!("crew.ssh" %in% loadedNamespaces())) {
+    crew_ssh_load(source)
+  }
+  key <- get("salvage_key", envir = asNamespace("crew.ssh"))
+  hash <- get("salvage_globals_hash", envir = asNamespace("crew.ssh"))
+  payload <- identity_payload()
+  key(
+    command = payload$command,
+    data = payload$data,
+    globals_hash = hash(payload$globals),
+    seed = 1L,
+    algorithm = NULL,
+    packages = character(0L),
+    library = NULL,
+    name = "identity"
+  )
+}
+
+# The lines every test pipeline starts with: load crew.ssh and point targets
+# at a controller whose "remote system" is a directory of this machine.
+pipeline_header <- function(remote) {
+  source <- crew_ssh_source()
+  load <- if (is.null(source)) {
+    "loadNamespace('crew.ssh')"
+  } else {
+    sprintf(
+      "pkgload::load_all(%s, quiet = TRUE, attach = FALSE, helpers = FALSE)",
+      deparse(source)
+    )
+  }
+  c(
+    load,
+    "library(targets)",
+    "tar_option_set(",
+    "  storage = 'main', retrieval = 'main', error = 'continue',",
+    "  packages = character(0),",
+    "  controller = crew.ssh::crew_controller_ssh(",
+    sprintf("    ssh_host = 'fakehost', ssh_command = %s,", deparse(fake_ssh())),
+    sprintf("    remote_directory = %s, salvage = TRUE,", deparse(remote)),
+    sprintf("    rscript = %s,", deparse(file.path(R.home("bin"), "Rscript"))),
+    "    seconds_idle = 60, workers = 2L",
+    "  )",
+    ")"
+  )
+}
+
+# A pipeline with one remote target that holds until the file `release`
+# exists.
+write_pipeline <- function(project, remote, multiplier) {
+  writeLines(
+    c(
+      pipeline_header(remote),
+      sprintf(
+        paste(
+          "slow_fit <- function(x) {",
+          "cat('run\\n', file = %s, append = TRUE);",
+          "while (!file.exists(%s)) Sys.sleep(0.2);",
+          "sum(x) * %s }"
+        ),
+        deparse(file.path(project, "fits.txt")),
+        deparse(file.path(project, "release")),
+        multiplier
+      ),
+      "list(",
+      "  tar_target(data, 1:10, deployment = 'main'),",
+      "  tar_target(fit, slow_fit(data)),",
+      "  tar_target(report, fit + 1, deployment = 'main')",
+      ")"
+    ),
+    file.path(project, "_targets.R")
+  )
+}
+
+# A pipeline whose remote target fails the first time it runs.
+write_flaky_pipeline <- function(project, remote) {
+  counter <- deparse(file.path(project, "flaky.txt"))
+  writeLines(
+    c(
+      pipeline_header(remote),
+      sprintf(
+        paste(
+          "flaky_fit <- function() {",
+          "cat('run\\n', file = %s, append = TRUE);",
+          "if (length(readLines(%s)) < 2L) stop('transient failure');",
+          "'recovered' }"
+        ),
+        counter,
+        counter
+      ),
+      "list(tar_target(flaky, flaky_fit()))"
+    ),
+    file.path(project, "_targets.R")
+  )
+}
+
+make_pipeline <- function(project, background = FALSE) {
+  targets::tar_make(
+    script = file.path(project, "_targets.R"),
+    store = file.path(project, "_targets"),
+    reporter = "silent",
+    callr_function = if (background) callr::r_bg else callr::r
+  )
+}
+
+# Run the pipeline until its remote target is computing, then kill the session.
+# The target holds until the file `release` exists.
+interrupted_pipeline <- function(project) {
+  first <- make_pipeline(project, background = TRUE)
+  wait_until(file.exists(file.path(project, "fits.txt")), seconds = 120)
+  first$kill()
+}

@@ -360,6 +360,7 @@ salvage_shipped <- function(
 ) {
   functions <- list(
     run = salvage_run,
+    reuse = salvage_reuse,
     read = salvage_read,
     problem = salvage_problem,
     outcome = salvage_outcome,
@@ -433,12 +434,7 @@ salvage_run <- function(expr, envir, key, name, reuse, salvage) {
     record <- if (reuse) salvage$read(path, key, salvage) else NULL
     reason <- if (is.null(record)) "" else salvage$reason(record, salvage)
     if (!is.null(record) && !nzchar(reason)) {
-      message(
-        "crew.ssh: task ", name, " reuses the result worker ", record$worker,
-        " saved at ", format(record$ended, usetz = TRUE), "."
-      )
-      salvage$state(salvage, worker, key, name, "reused")
-      return(record$value)
+      return(salvage$reuse(record, salvage, worker, key, name))
     }
     if (nzchar(reason) && !identical(reason, explained)) {
       message(
@@ -488,8 +484,7 @@ salvage_run <- function(expr, envir, key, name, reuse, salvage) {
   if (reuse) {
     record <- salvage$read(path, key, salvage)
     if (!is.null(record) && !nzchar(salvage$reason(record, salvage))) {
-      salvage$state(salvage, worker, key, name, "reused")
-      return(record$value)
+      return(salvage$reuse(record, salvage, worker, key, name))
     }
   }
   # Temporary files left by a writer that died midway are never read, only
@@ -548,6 +543,19 @@ salvage_run <- function(expr, envir, key, name, reuse, salvage) {
     stop(out)
   }
   out$value
+}
+
+# Hand back a saved result instead of running the task, and say so. A waiter
+# reaches this from its read before the lock, or from its read after taking
+# the lock, when the worker it waited for saved its result and let go of the
+# lock between the two.
+salvage_reuse <- function(record, salvage, worker, key, name) {
+  message(
+    "crew.ssh: task ", name, " reuses the result worker ", record$worker,
+    " saved at ", format(record$ended, usetz = TRUE), "."
+  )
+  salvage$state(salvage, worker, key, name, "reused")
+  record$value
 }
 
 # How a task that returned ended. targets catches an error in a target's
