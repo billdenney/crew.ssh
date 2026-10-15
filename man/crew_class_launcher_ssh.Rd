@@ -46,6 +46,7 @@ Other plugin_ssh:
     \item \href{#method-crew_class_launcher_ssh-validate}{\code{crew_class_launcher_ssh$validate()}}
     \item \href{#method-crew_class_launcher_ssh-start}{\code{crew_class_launcher_ssh$start()}}
     \item \href{#method-crew_class_launcher_ssh-settings}{\code{crew_class_launcher_ssh$settings()}}
+    \item \href{#method-crew_class_launcher_ssh-scale}{\code{crew_class_launcher_ssh$scale()}}
     \item \href{#method-crew_class_launcher_ssh-launch_worker}{\code{crew_class_launcher_ssh$launch_worker()}}
     \item \href{#method-crew_class_launcher_ssh-logs}{\code{crew_class_launcher_ssh$logs()}}
     \item \href{#method-crew_class_launcher_ssh-remote_workers}{\code{crew_class_launcher_ssh$remote_workers()}}
@@ -64,7 +65,6 @@ Other plugin_ssh:
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_launcher" data-id="launch"><a href='../../crew/html/crew_class_launcher.html#method-crew_class_launcher-launch'><code>crew::crew_class_launcher$launch()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_launcher" data-id="launch_workers"><a href='../../crew/html/crew_class_launcher.html#method-crew_class_launcher-launch_workers'><code>crew::crew_class_launcher$launch_workers()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_launcher" data-id="poll"><a href='../../crew/html/crew_class_launcher.html#method-crew_class_launcher-poll'><code>crew::crew_class_launcher$poll()</code></a></span></li>
-  <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_launcher" data-id="scale"><a href='../../crew/html/crew_class_launcher.html#method-crew_class_launcher-scale'><code>crew::crew_class_launcher$scale()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_launcher" data-id="set_name"><a href='../../crew/html/crew_class_launcher.html#method-crew_class_launcher-set_name'><code>crew::crew_class_launcher$set_name()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_launcher" data-id="terminate_workers"><a href='../../crew/html/crew_class_launcher.html#method-crew_class_launcher-terminate_workers'><code>crew::crew_class_launcher$terminate_workers()</code></a></span></li>
 </ul>
@@ -89,6 +89,7 @@ Other plugin_ssh:
   remote_directory = "/tmp",
   salvage = TRUE,
   salvage_directory = NULL,
+  seconds_reconnect = 3600,
   verbose = FALSE
 )}
     \if{html}{\out{</div>}}
@@ -141,6 +142,10 @@ to the directory on the remote system where workers save results.
 \code{remote_directory}. Unlike the session directories, it is shared by
 every session, which is how a later session finds the results of an
 earlier one.}
+      \item{\code{seconds_reconnect}}{Non-negative number of length 1, how long to
+keep trying when the network fails while reopening the tunnel or
+launching a worker, in seconds of pauses between attempts. See the
+"Surviving a disconnect" section of \code{\link[=crew_controller_ssh]{crew_controller_ssh()}}.}
       \item{\code{verbose}}{Logical of length 1, whether to print messages about the
 tunnel and each worker launch.}
     }
@@ -210,6 +215,37 @@ before it exits.
   }
   \subsection{Returns}{
     A named list of \code{mirai} daemon settings.
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-scale"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-scale}{}}}
+\subsection{\code{crew_class_launcher_ssh$scale()}}{
+  Launch workers to match the tasks pushed so far.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$scale(status, throttle = NULL)}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Arguments}{
+    \if{html}{\out{<div class="arguments">}}
+    \describe{
+      \item{\code{status}}{A list of task and connection counts from the \code{crew}
+client.}
+      \item{\code{throttle}}{Logical of length 1 or \code{NULL}, whether to throttle
+scaling.}
+    }
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    As in \code{crew}, except that with \code{salvage = TRUE}, tasks still
+running on workers this controller cannot reach count against
+\code{workers} until they finish or this controller pushes them again.
+See the "Surviving a disconnect" section of \code{\link[=crew_controller_ssh]{crew_controller_ssh()}}.
+  }
+  \subsection{Returns}{
+    \code{TRUE} if it launched workers, \code{FALSE} otherwise, invisibly.
   }
 }
 

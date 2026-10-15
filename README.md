@@ -146,9 +146,11 @@ by this one retrying a task whose worker was cut off, there are two cases:
 
 With `targets`, this means re-running `tar_make()` after a dropped connection
 picks up the remote targets that were in flight, finished or still running,
-instead of starting them over. `targets` decides when they come up, though,
-and until it pushes them their old workers run alongside the new session's
-own, so the remote machine can be busier than `workers` suggests.
+instead of starting them over. `targets` decides when they come up, but until
+then their old workers count against `workers`, so the remote machine never
+runs more tasks at once than `workers`. If the network is still down when
+`crew.ssh` reopens its tunnel or launches a worker, it keeps trying for up to
+`seconds_reconnect` (an hour by default) instead of stopping the pipeline.
 
 A task is matched by its name and by everything it computes from, so a target
 whose code or data changed in between runs again. A saved error is never

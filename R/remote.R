@@ -17,8 +17,25 @@
 # and the container runtime on the remote system, so the scripts use POSIX sh
 # and not R.
 
-remote_workers_script <- function(remote_directory) {
-  paste(
+#
+# `states`, when given, limits the workers to those whose latest task is in one
+# of these states, and skips the others before the process and container
+# checks, which over many old sessions are what take the time.
+remote_workers_script <- function(remote_directory, states = NULL) {
+  filter <- if (is.null(states)) {
+    character(0L)
+  } else {
+    c(
+      "    st=",
+      "    [ -s \"$d$w.task\" ] && st=$(sed -n 's/^task_state: //p' \"$d$w.task\")",
+      paste0(
+        "    case \"$st\" in ",
+        paste(shQuote(states, type = "sh"), collapse = "|"),
+        ") ;; *) continue ;; esac"
+      )
+    )
+  }
+  lines <- c(
     paste0(
       "for d in ", shQuote(remote_directory, type = "sh"), "/crew-ssh-*/; do"
     ),
@@ -37,6 +54,7 @@ remote_workers_script <- function(remote_directory) {
     "  for p in \"$d\"worker-*.pid; do",
     "    [ -f \"$p\" ] || continue",
     "    w=$(basename \"$p\" .pid)",
+    filter,
     "    pid=$(cat \"$p\")",
     "    alive=FALSE",
     "    case \"$(ps -p \"$pid\" -o args= 2>/dev/null)\" in",
@@ -58,9 +76,9 @@ remote_workers_script <- function(remote_directory) {
     "    echo",
     "  done",
     "done",
-    "exit 0",
-    sep = "\n"
+    "exit 0"
   )
+  paste(lines, collapse = "\n")
 }
 
 remote_salvage_script <- function(directory) {
@@ -190,6 +208,27 @@ remote_stop_waiters_script <- function(remote_directory, session) {
     "done",
     sep = "\n"
   )
+}
+
+# The tasks still running on workers the controller cannot reach, as a data
+# frame of their `task_key` and `task_name`: tasks of workers of other
+# sessions whose tunnel is gone, and of this session's workers named in
+# `disconnected`, which it launched before its tunnel was last reopened.
+# `workers` is a remote_workers_frame().
+remote_unreachable_tasks <- function(workers, disconnected) {
+  cut_off <- ifelse(
+    workers$current,
+    workers$worker %in% disconnected,
+    !workers$session_alive
+  )
+  running <- workers$alive &
+    workers$task_state %in% "running" &
+    !is.na(workers$task_key) &
+    cut_off
+  out <- workers[running, c("task_key", "task_name"), drop = FALSE]
+  out <- out[!duplicated(out$task_key), , drop = FALSE]
+  rownames(out) <- NULL
+  out
 }
 
 # The workers remote_stop_waiters_script() reports in `output`, each as

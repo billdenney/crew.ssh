@@ -273,6 +273,101 @@ test_that("remote_stop_waiters_script() does nothing without sessions", {
   expect_identical(run_sh(paste(script, "exit 0", sep = "\n")), "")
 })
 
+test_that("remote_workers_script() can skip workers by the state of their task", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  directory <- write_session_records(remote, "crew-ssh-a", Sys.getpid())
+  for (state in c("running", "waiting", "success")) {
+    write_worker_records(
+      directory, paste0("worker-", state), Sys.getpid(), state,
+      paste0("task_", state)
+    )
+  }
+  # A worker that has not started a task has no task file.
+  writeLines(as.character(Sys.getpid()), file.path(directory, "worker-none.pid"))
+  all <- remote_workers_frame(
+    run_sh(remote_workers_script(remote)), "host", remote, "crew-ssh-x"
+  )
+  expect_identical(
+    sort(all$worker),
+    c("worker-none", "worker-running", "worker-success", "worker-waiting")
+  )
+  some <- remote_workers_frame(
+    run_sh(remote_workers_script(remote, states = c("running", "waiting"))),
+    "host", remote, "crew-ssh-x"
+  )
+  expect_identical(sort(some$worker), c("worker-running", "worker-waiting"))
+  expect_identical(
+    some$task_state[order(some$worker)],
+    c("running", "waiting")
+  )
+})
+
+# One record in the format remote_workers_script() prints.
+worker_record <- function(session, session_alive, worker, alive, state,
+                          key = NA, name = NA) {
+  c(
+    paste("session:", session),
+    paste("session_alive:", session_alive),
+    paste("worker:", worker),
+    "pid: 1",
+    paste("process_alive:", alive),
+    if (!is.na(key)) paste("task_key:", key),
+    if (!is.na(name)) paste("task_name:", name),
+    paste("task_state:", state),
+    ""
+  )
+}
+
+test_that("remote_unreachable_tasks() finds the running tasks no connection reaches", {
+  text <- paste(
+    c(
+      # A running worker of a session that is gone: counted.
+      worker_record("crew-ssh-dead", "FALSE", "worker-a", "TRUE", "running", "fit-1", "fit"),
+      # Its process is gone too: not running any more.
+      worker_record("crew-ssh-dead", "FALSE", "worker-b", "FALSE", "running", "gone-2", "gone"),
+      # A second record of the same task counts once.
+      worker_record("crew-ssh-dead", "FALSE", "worker-c", "TRUE", "running", "fit-1", "fit"),
+      # A waiter computes nothing.
+      worker_record("crew-ssh-dead", "FALSE", "worker-d", "TRUE", "waiting", "wait-3", "wait"),
+      # A connected session's worker is that session's to count.
+      worker_record("crew-ssh-live", "TRUE", "worker-e", "TRUE", "running", "live-4", "live"),
+      # This session's worker from before the tunnel was reopened: counted.
+      worker_record("crew-ssh-me", "TRUE", "worker-f", "TRUE", "running", "old-5", "old"),
+      # This session's connected worker is already counted by crew.
+      worker_record("crew-ssh-me", "TRUE", "worker-g", "TRUE", "running", "new-6", "new"),
+      # A running record without a key cannot be matched to anything.
+      worker_record("crew-ssh-dead", "FALSE", "worker-h", "TRUE", "running"),
+      # A finished task takes up nothing.
+      worker_record("crew-ssh-me", "TRUE", "worker-i", "TRUE", "success", "done-7", "done")
+    ),
+    collapse = "\n"
+  )
+  workers <- remote_workers_frame(text, "host", "/remote", session = "crew-ssh-me")
+  expect_identical(
+    remote_unreachable_tasks(workers, disconnected = c("worker-f", "worker-i")),
+    data.frame(
+      task_key = c("fit-1", "old-5"),
+      task_name = c("fit", "old"),
+      stringsAsFactors = FALSE
+    )
+  )
+  # Without the reopen, this session's worker is reachable.
+  expect_identical(
+    remote_unreachable_tasks(workers, disconnected = character(0L))$task_key,
+    "fit-1"
+  )
+  none <- remote_workers_frame("", "host", "/remote", session = "crew-ssh-me")
+  expect_identical(
+    remote_unreachable_tasks(none, disconnected = character(0L)),
+    data.frame(
+      task_key = character(0L),
+      task_name = character(0L),
+      stringsAsFactors = FALSE
+    )
+  )
+})
+
 test_that("remote_stopped_waiters() reads the workers the tunnel reports stopping", {
   output <- c(
     "crew-ssh-tunnel-ready",

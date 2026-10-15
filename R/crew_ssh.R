@@ -78,6 +78,10 @@ crew_class_launcher_ssh <- R6::R6Class(
     #'   `remote_directory`. Unlike the session directories, it is shared by
     #'   every session, which is how a later session finds the results of an
     #'   earlier one.
+    #' @param seconds_reconnect Non-negative number of length 1, how long to
+    #'   keep trying when the network fails while reopening the tunnel or
+    #'   launching a worker, in seconds of pauses between attempts. See the
+    #'   "Surviving a disconnect" section of [crew_controller_ssh()].
     #' @param verbose Logical of length 1, whether to print messages about the
     #'   tunnel and each worker launch.
     initialize = function(
@@ -93,6 +97,7 @@ crew_class_launcher_ssh <- R6::R6Class(
       remote_directory = "/tmp",
       salvage = TRUE,
       salvage_directory = NULL,
+      seconds_reconnect = 3600,
       verbose = FALSE
     ) {
       super$initialize(...)
@@ -107,6 +112,7 @@ crew_class_launcher_ssh <- R6::R6Class(
       private$.remote_directory <- remote_directory
       private$.salvage <- salvage
       private$.salvage_directory <- salvage_directory
+      private$.seconds_reconnect <- seconds_reconnect
       private$.verbose <- verbose
     },
     #' @description Validate the launcher.
@@ -194,6 +200,14 @@ crew_class_launcher_ssh <- R6::R6Class(
         )
       )
       crew::crew_assert(
+        private$.seconds_reconnect,
+        is.numeric(.),
+        length(.) == 1L,
+        !anyNA(.),
+        . >= 0,
+        message = "seconds_reconnect must be a single non-negative number."
+      )
+      crew::crew_assert(
         private$.verbose,
         isTRUE(.) || isFALSE(.),
         message = "verbose must be TRUE or FALSE."
@@ -214,6 +228,9 @@ crew_class_launcher_ssh <- R6::R6Class(
         private$.session
       )
       private$.handles <- list()
+      private$.disconnected <- character(0L)
+      private$.unreachable <- private$.unreachable[0L, , drop = FALSE]
+      private$.unreachable_checked <- -Inf
       # Hashed environments, because a pipeline may push and collect hundreds
       # of thousands of tasks, and growing a vector costs a copy each time.
       private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
@@ -248,6 +265,26 @@ crew_class_launcher_ssh <- R6::R6Class(
       }
       out
     },
+    #' @description Launch workers to match the tasks pushed so far.
+    #' @details As in `crew`, except that with `salvage = TRUE`, tasks still
+    #'   running on workers this controller cannot reach count against
+    #'   `workers` until they finish or this controller pushes them again.
+    #'   See the "Surviving a disconnect" section of [crew_controller_ssh()].
+    #' @return `TRUE` if it launched workers, `FALSE` otherwise, invisibly.
+    #' @param status A list of task and connection counts from the `crew`
+    #'   client.
+    #' @param throttle Logical of length 1 or `NULL`, whether to throttle
+    #'   scaling.
+    scale = function(status, throttle = NULL) {
+      busy <- private$unreachable_busy(status)
+      if (busy < 1L) {
+        return(super$scale(status = status, throttle = throttle))
+      }
+      workers <- private$.workers
+      on.exit(private$.workers <- workers, add = TRUE)
+      private$.workers <- max(0L, workers - busy)
+      super$scale(status = status, throttle = throttle)
+    },
     #' @description Launch a worker on the remote system.
     #' @return A handle: a named list with the worker `name`, the remote
     #'   process ID `pid`, and the remote paths of the worker `script`, its
@@ -255,41 +292,22 @@ crew_class_launcher_ssh <- R6::R6Class(
     #'   runs under `docker run` or `podman run`.
     #' @param call Character of length 1, R code the worker should run.
     launch_worker = function(call) {
-      private$tunnel_check()
       name <- paste0("worker-", crew::crew_random_name())
       paths <- private$worker_paths(name)
-      # The worker code travels over the ssh session's stdin instead of the
-      # command line so that no amount of quoting in the deparsed call can
-      # confuse the remote shell. The variable tells the worker its name,
-      # which the salvage records use, and marks it as a crew.ssh worker.
       local_script <- tempfile(pattern = "crew_ssh_", fileext = ".R")
       on.exit(unlink(local_script), add = TRUE)
-      writeLines(
-        c(sprintf("Sys.setenv(CREW_SSH_WORKER = %s)", deparse(name)), call),
-        con = local_script
-      )
       command <- private$worker_command(name)
       if (private$.verbose) {
         message("crew.ssh: launching ", name, ", log at ", paths$log)
       }
-      out <- private$run(
+      pid <- private$retry(
+        what = paste("launch a worker on", private$.ssh_host),
+        attempt = "launch_attempt",
+        call = call,
+        name = name,
         command = command,
-        stdin = local_script,
-        timeout = private$.seconds_launch
+        local_script = local_script
       )
-      pid <- trimws(out$stdout)
-      if (!identical(out$status, 0L) || !grepl("^[0-9]+$", pid)) {
-        crew::crew_assert(
-          FALSE,
-          message = paste0(
-            "Could not launch a crew worker on ", private$.ssh_host, ". ",
-            "ssh exited with status ", out$status,
-            if (isTRUE(out$timeout)) " (timed out)" else "",
-            ".\nstdout: ", trimws(out$stdout),
-            "\nstderr: ", trimws(out$stderr)
-          )
-        )
-      }
       handle <- list(
         name = name,
         pid = pid,
@@ -595,10 +613,26 @@ crew_class_launcher_ssh <- R6::R6Class(
     .remote_directory = NULL,
     .salvage = NULL,
     .salvage_directory = NULL,
+    .seconds_reconnect = NULL,
+    # The first and the longest pause between attempts of retry(), in
+    # seconds; each pause doubles the last.
+    .reconnect_pauses = c(first = 5, longest = 30),
     .verbose = NULL,
     .session = NULL,
     .session_directory = NULL,
     .handles = list(),
+    # Workers of this session launched before its tunnel was last reopened.
+    .disconnected = character(0L),
+    # Tasks running on workers this controller cannot reach (see
+    # unreachable_busy()), when they were last read, and how often to read
+    # them, in seconds.
+    .unreachable = data.frame(
+      task_key = character(0L),
+      task_name = character(0L),
+      stringsAsFactors = FALSE
+    ),
+    .unreachable_checked = -Inf,
+    .unreachable_seconds = 30,
     .tunnel = NULL,
     .tunnel_port = NULL,
     .tunnel_output = character(0L),
@@ -907,7 +941,15 @@ crew_class_launcher_ssh <- R6::R6Class(
           " is down. Reopening it. Previous ssh output:\n",
           paste(private$.tunnel_output, collapse = "\n")
         )
-        private$tunnel_start()
+        # Every worker launched so far lost its connection with the tunnel.
+        private$.disconnected <- union(
+          private$.disconnected,
+          names(private$.handles)
+        )
+        private$retry(
+          what = paste("reopen the ssh tunnel to", private$.ssh_host),
+          attempt = "tunnel_attempt"
+        )
       }
       invisible()
     },
@@ -919,6 +961,189 @@ crew_class_launcher_ssh <- R6::R6Class(
       }
       private$.tunnel_port <- NULL
       invisible()
+    },
+    # Run `attempt`, a private method that makes one try and returns a list
+    # with either the `value` it got or the `failure` it met, until a try
+    # succeeds or the pauses between tries add up to seconds_reconnect. Only
+    # the pauses count, so the time this machine spends asleep does not use up
+    # the allowance, and a session that wakes before the network does keeps
+    # going once it is back. The arguments in `...` go to `attempt`.
+    retry = function(what, attempt, ...) {
+      waited <- 0
+      tries <- 0L
+      repeat {
+        tries <- tries + 1L
+        outcome <- private[[attempt]](...)
+        if (is.null(outcome$failure)) {
+          if (tries > 1L) {
+            message(
+              "crew.ssh: managed to ", what, " at attempt ", tries, "."
+            )
+          }
+          return(outcome$value)
+        }
+        failure <- gsub("\\s+", " ", trimws(outcome$failure))
+        remaining <- private$.seconds_reconnect - waited
+        crew::crew_assert(
+          remaining > 0,
+          message = paste0(
+            "crew.ssh could not ", what, " in ", tries, " attempt(s) over ",
+            round(waited), " seconds of retrying (seconds_reconnect = ",
+            private$.seconds_reconnect, "). Last failure: ", failure
+          )
+        )
+        pause <- min(
+          remaining,
+          private$.reconnect_pauses[["longest"]],
+          private$.reconnect_pauses[["first"]] * 2^(tries - 1L)
+        )
+        message(
+          "crew.ssh: could not ", what, " (", failure, "). Trying again in ",
+          round(pause, 1L), " seconds."
+        )
+        Sys.sleep(pause)
+        waited <- waited + pause
+      }
+    },
+    tunnel_attempt = function() {
+      error <- tryCatch(private$tunnel_start(), error = identity)
+      if (inherits(error, "error")) {
+        private$tunnel_stop()
+        return(list(failure = conditionMessage(error)))
+      }
+      list(value = NULL)
+    },
+    # One launch. The worker code travels over the ssh session's stdin instead
+    # of the command line so that no amount of quoting in the deparsed call
+    # can confuse the remote shell. The variable tells the worker its name,
+    # which the salvage records use, and marks it as a crew.ssh worker.
+    #
+    # ssh exits with status 255 when ssh itself fails, as when the network is
+    # down, which is worth another try, as is a launch that timed out. Any
+    # other failure is the remote command's, and an error.
+    launch_attempt = function(call, name, command, local_script) {
+      private$tunnel_check()
+      writeLines(
+        c(
+          sprintf("Sys.setenv(CREW_SSH_WORKER = %s)", deparse(name)),
+          private$current_url(call)
+        ),
+        con = local_script
+      )
+      out <- private$run(
+        command = command,
+        stdin = local_script,
+        timeout = private$.seconds_launch
+      )
+      pid <- trimws(out$stdout)
+      if (identical(out$status, 0L) && grepl("^[0-9]+$", pid)) {
+        return(list(value = pid))
+      }
+      failure <- paste0(
+        "ssh exited with status ", out$status,
+        if (isTRUE(out$timeout)) " (timed out)" else "",
+        ".\nstdout: ", trimws(out$stdout),
+        "\nstderr: ", trimws(out$stderr)
+      )
+      if (identical(out$status, 255L) || isTRUE(out$timeout)) {
+        return(list(failure = failure))
+      }
+      crew::crew_assert(
+        FALSE,
+        message = paste0(
+          "Could not launch a crew worker on ", private$.ssh_host, ". ",
+          failure
+        )
+      )
+    },
+    # The number of tasks running on workers this controller cannot reach, as
+    # remote_unreachable_tasks() finds them, less those this session has
+    # pushed again: the worker that takes such a task holds a slot of its own
+    # while it hands back the saved result or waits for the running one. The
+    # remote records are read only when crew might launch a worker, with more
+    # tasks than connected workers, and at most every .unreachable_seconds. A
+    # read that fails, as when the network is down, leaves the last count
+    # standing.
+    unreachable_busy = function(status) {
+      if (!isTRUE(private$.salvage) || is.null(private$.session)) {
+        return(0L)
+      }
+      tasks <- .subset2(status, "awaiting") + .subset2(status, "executing")
+      due <- as.numeric(Sys.time()) - private$.unreachable_checked >=
+        private$.unreachable_seconds
+      if (due && tasks > .subset2(status, "connections")) {
+        private$.unreachable_checked <- as.numeric(Sys.time())
+        out <- private$run(
+          command = remote_workers_script(
+            private$.remote_directory,
+            states = c("running", "waiting")
+          ),
+          timeout = min(private$.seconds_timeout, private$.unreachable_seconds)
+        )
+        if (identical(out$status, 0L)) {
+          private$unreachable_update(
+            remote_unreachable_tasks(
+              workers = remote_workers_frame(
+                text = out$stdout,
+                host = private$.ssh_host,
+                remote_directory = private$.remote_directory,
+                session = private$.session
+              ),
+              disconnected = private$.disconnected
+            )
+          )
+        }
+      }
+      private$unreachable_unpushed()
+    },
+    unreachable_unpushed = function() {
+      tasks <- private$.unreachable
+      pushed <- vapply(
+        tasks$task_name,
+        pushed_key,
+        character(1L),
+        keys = private$.salvage_keys,
+        USE.NAMES = FALSE
+      )
+      sum(is.na(pushed) | pushed != tasks$task_key)
+    },
+    unreachable_update = function(tasks) {
+      if (identical(tasks$task_key, private$.unreachable$task_key)) {
+        return(invisible())
+      }
+      private$.unreachable <- tasks
+      if (nrow(tasks)) {
+        message(
+          "crew.ssh: ", nrow(tasks), " task(s) are still running on workers ",
+          "of ", private$.ssh_host, " that this controller cannot reach (",
+          paste(tasks$task_name, collapse = ", "), "). Until they finish or ",
+          "this controller pushes them again, they count against its ",
+          private$.workers, " worker(s), so it launches at most ",
+          max(0L, private$.workers - private$unreachable_unpushed()), "."
+        )
+      } else {
+        message(
+          "crew.ssh: no tasks are running on unreachable workers of ",
+          private$.ssh_host, " any more, so this controller launches up to ",
+          private$.workers, " worker(s) again."
+        )
+      }
+      invisible()
+    },
+    # crew builds `call` once per launch() with the URL of the tunnel at the
+    # time, and a reopened tunnel listens on a new port. crew passes `call` as
+    # a promise that launch_attempt() forces after its tunnel check, so only
+    # a later try, or a later worker of the same launch(), can hold an old
+    # port, which this replaces with the port of the tunnel open now.
+    current_url = function(call) {
+      if (is.null(private$.tunnel_port)) {
+        return(call)
+      }
+      sub(
+        "url = \"[A-Za-z+]+://127\\.0\\.0\\.1:[0-9]+\"",
+        paste0("url = \"", private$worker_url(), "\""),
+        call
+      )
     },
     workers_stop = function() {
       handles <- private$.handles
@@ -1201,6 +1426,22 @@ crew_class_controller_ssh <- R6::R6Class(
 #'      session to open a tunnel to the same `remote_directory`, or the same
 #'      session when it reconnects, stops it with a message. The worker it
 #'      waited for still saves the result.
+#'   5. A task still running on a worker the controller cannot reach, one of
+#'      a session that is gone or one of this session from before its tunnel
+#'      was reopened, takes up the remote system as much as a connected
+#'      worker does, so it counts against `workers` until it finishes: the
+#'      controller launches only as many workers as are left, and says so.
+#'      Once the same task is pushed again, the worker that takes it holds
+#'      the slot instead, while it hands back the saved result or waits for
+#'      the running one. The controller reads the remote records for this at
+#'      most every 30 seconds.
+#'
+#'   Whether or not salvage is on, a failure of the network while the
+#'   controller reopens its tunnel or launches a worker is retried, with
+#'   pauses that grow from 5 to 30 seconds, until the pauses add up to
+#'   `seconds_reconnect`; only then is it an error. Time the local machine
+#'   spends asleep does not count, so a laptop that wakes before its network
+#'   does carries on once the network is back.
 #'
 #'   A task is identified by its name and by everything it computes from: the
 #'   command, data, globals, seed, and packages, or for a `targets` target,
@@ -1259,6 +1500,11 @@ crew_class_controller_ssh <- R6::R6Class(
 #'   `remote_directory`. `/tmp`, the default `remote_directory`, may be
 #'   cleared when the remote system restarts, so choose a durable directory
 #'   for results that must outlast that.
+#' @param seconds_reconnect Non-negative number of length 1, how long to keep
+#'   trying when the network fails while reopening the tunnel or launching a
+#'   worker, counted in seconds of pauses between attempts. `0` gives up at
+#'   the first failure and `Inf` never does. See the "Surviving a disconnect"
+#'   section.
 #' @param verbose Logical of length 1, whether to print messages about the
 #'   tunnel and each worker launch.
 #' @param host Character of length 1, local address of the `mirai` dispatcher.
@@ -1286,6 +1532,7 @@ crew_controller_ssh <- function(
   remote_directory = "/tmp",
   salvage = TRUE,
   salvage_directory = NULL,
+  seconds_reconnect = 3600,
   verbose = FALSE,
   name = NULL,
   workers = 1L,
@@ -1340,6 +1587,7 @@ crew_controller_ssh <- function(
     remote_directory = remote_directory,
     salvage = salvage,
     salvage_directory = salvage_directory,
+    seconds_reconnect = seconds_reconnect,
     verbose = verbose,
     name = name,
     workers = workers,
@@ -1369,6 +1617,15 @@ crew_controller_ssh <- function(
 }
 
 # Utilities ----
+
+# The salvage key under which this session pushed the task called `name` and
+# has not collected it yet, or NA.
+pushed_key <- function(name, keys) {
+  if (is.null(keys) || is.na(name) || !nzchar(name)) {
+    return(NA_character_)
+  }
+  get0(name, envir = keys, inherits = FALSE, ifnotfound = NA_character_)
+}
 
 # Run one command on the remote system and hand the whole result back. The
 # caller decides what a failure means, so nothing is thrown here.
