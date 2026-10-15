@@ -357,6 +357,16 @@ the running one. The controller reads the remote records for this at
 most every 30 seconds.
 }
 
+A session is gone when the remote end of its tunnel has stopped, or,
+for a session started on the same machine, when the R process that
+started it has ended. The second matters after a laptop drops off the
+network: the remote \code{sshd} can keep the tunnel's remote end for hours,
+which would otherwise make the session look connected. Each session
+records its machine, process ID, and process creation time, so a process
+ID the system has since given to another process does not count. When a
+tunnel opens, the controller also closes the lingering remote ends of the
+sessions it knows have ended, and stops their waiting workers.
+
 Whether or not salvage is on, a failure of the network while the
 controller reopens its tunnel or launches a worker is retried, with
 pauses that double from about 5 seconds to at most 5 minutes, each

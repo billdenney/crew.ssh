@@ -400,6 +400,16 @@ launcher$terminate_orphans()
 Stopping an orphaned worker throws away the target it is computing, which
 with salvage it would otherwise save for you.
 
+A session is gone when the remote end of its tunnel has stopped. After a
+laptop drops off the network, though, the remote `sshd` can keep that end
+running for hours, because it never hears that the laptop went away. So for a
+session started on the same machine, `crew.ssh` also checks whether the R
+process that started it still runs, by its process ID and creation time, and
+counts the session as gone if it does not. When it opens a tunnel, it closes
+the lingering remote ends of such sessions and stops their waiting workers.
+A remote `sshd` configured with `ClientAliveInterval` notices dead clients on
+its own, which also covers sessions started on other machines.
+
 ### Running the whole pipeline remotely
 
 For a pipeline that must keep going while you are logged off, rather than pick

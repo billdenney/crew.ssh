@@ -520,6 +520,11 @@ test_that("the salvage directory defaults to one shared by all sessions", {
   expect_identical(private$salvage_root(), "/data/results")
 })
 
+# The creation time of this R process as a session records it.
+created_here <- function() {
+  sprintf("%.3f", as.numeric(ps::ps_create_time(ps::ps_handle())))
+}
+
 test_that("the tunnel command records the session and then waits on stdin", {
   private <- crew_controller_ssh(
     ssh_host = "user@example.com",
@@ -535,7 +540,8 @@ test_that("the tunnel command records the session and then waits on stdin", {
       "mkdir -p '/tmp/crew-ssh-abc' && ",
       "printf '%s\\n' 'session: crew-ssh-abc' 'controller: ctl' ",
       "'runtime: docker' 'local_host: ", Sys.info()[["nodename"]], "' ",
-      "'local_pid: ", Sys.getpid(), "' \"started: $(date +%s)\" > ",
+      "'local_pid: ", Sys.getpid(), "' ",
+      "'local_created: ", created_here(), "' \"started: $(date +%s)\" > ",
       "'/tmp/crew-ssh-abc/session.dcf' && ",
       "echo $$ > '/tmp/crew-ssh-abc/tunnel.pid' && ",
       "echo crew-ssh-tunnel-ready && ",
@@ -565,11 +571,24 @@ test_that("with salvage, the tunnel command stops stranded waiters before record
       "\n:; } && ",
       "printf '%s\\n' 'session: crew-ssh-abc' 'controller: ctl' ",
       "'runtime: ' 'local_host: ", Sys.info()[["nodename"]], "' ",
-      "'local_pid: ", Sys.getpid(), "' \"started: $(date +%s)\" > ",
+      "'local_pid: ", Sys.getpid(), "' ",
+      "'local_created: ", created_here(), "' \"started: $(date +%s)\" > ",
       "'/scratch/crew-ssh-abc/session.dcf' && ",
       "echo $$ > '/scratch/crew-ssh-abc/tunnel.pid' && ",
       "echo crew-ssh-tunnel-ready && ",
       "exec sh -c 'cat > /dev/null; :' 'crew-ssh-abc'"
+    )
+  )
+  # Sessions known to have ended reach the script that stops their waiters.
+  expect_true(
+    grepl(
+      remote_stop_waiters_script(
+        "/scratch",
+        session = "crew-ssh-abc",
+        dead = c("crew-ssh-old", "crew-ssh-older")
+      ),
+      private$tunnel_command(dead = c("crew-ssh-old", "crew-ssh-older")),
+      fixed = TRUE
     )
   )
 })
@@ -1338,6 +1357,112 @@ test_that("a task left running by a dead session counts against workers", {
   controller$wait(mode = "all", seconds_timeout = 60)
   expect_identical(controller$pop()$result[[1L]], 42L)
   expect_identical(count_runs(counter), 1L)
+})
+
+test_that("a session started here counts as gone once its R process ends, whatever its tunnel says", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  session <- session_in_background(
+    remote,
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow"
+  )
+  on.exit(session$kill())
+  wait_until(file.exists(counter))
+  session$kill()
+  old <- other_session(remote, current = NULL)
+  wait_until(!pid_alive(readLines(file.path(remote, old, "tunnel.pid"))), seconds = 30)
+  # A stand-in for the remote end of the old tunnel that sshd keeps after the
+  # laptop running the session dropped off the network.
+  lingering <- processx::process$new(
+    "sh",
+    c("-c", "sleep 120; :", old),
+    cleanup = TRUE
+  )
+  on.exit(lingering$kill(), add = TRUE)
+  writeLines(as.character(lingering$get_pid()), file.path(remote, old, "tunnel.pid"))
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  private <- controller$launcher$.__enclos_env__$private
+  private$.unreachable_seconds <- 0.5
+  expect_message(
+    controller$start(),
+    paste0(
+      "closed the remote end of the tunnel of 1 session(s) on fakehost that ",
+      "this machine started and whose R process has ended: ", old
+    ),
+    fixed = TRUE
+  )
+  wait_until(!lingering$is_alive(), seconds = 10)
+  workers <- controller$launcher$remote_workers()
+  expect_identical(workers$session_alive[workers$session == old], FALSE)
+  # The task still running there takes the only slot.
+  expect_message(
+    {
+      controller$push(command = 6L * 7L, name = "quick")
+      controller$wait(mode = "all", seconds_timeout = 3)
+    },
+    paste0(
+      "1 task(s) are still running on workers of fakehost that this ",
+      "controller cannot reach (slow)."
+    ),
+    fixed = TRUE
+  )
+  expect_length(private$.handles, 0L)
+  file.create(release)
+  controller$wait(mode = "all", seconds_timeout = 120)
+  expect_identical(controller$pop()$result[[1L]], 42L)
+})
+
+test_that("remote_workers() counts a session started here as gone once its R process ends", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate())
+  controller$start()
+  launcher <- controller$launcher
+  private <- launcher$.__enclos_env__$private
+  # A record of a session this machine started, whose R process has ended,
+  # and whose tunnel end lingers.
+  ended <- callr::r_bg(Sys.getpid)
+  ended$wait(10000)
+  directory <- file.path(remote, "crew-ssh-ended")
+  dir.create(directory)
+  lingering <- processx::process$new(
+    "sh",
+    c("-c", "sleep 120; :", "crew-ssh-ended"),
+    cleanup = TRUE
+  )
+  on.exit(lingering$kill(), add = TRUE)
+  writeLines(
+    c(
+      "session: crew-ssh-ended",
+      paste("local_host:", Sys.info()[["nodename"]]),
+      paste("local_pid:", ended$get_pid()),
+      "local_created: 1"
+    ),
+    file.path(directory, "session.dcf")
+  )
+  writeLines(as.character(lingering$get_pid()), file.path(directory, "tunnel.pid"))
+  writeLines(as.character(lingering$get_pid()), file.path(directory, "worker-a.pid"))
+  workers <- launcher$remote_workers()
+  expect_identical(workers$session, "crew-ssh-ended")
+  expect_identical(workers$session_alive, FALSE)
+  # Its own session, started by this process, stays connected.
+  expect_identical(
+    local_session_alive(
+      Sys.info()[["nodename"]],
+      Sys.getpid(),
+      as.numeric(ps::ps_create_time(ps::ps_handle()))
+    ),
+    TRUE
+  )
+  expect_identical(private$dead_sessions(), "crew-ssh-ended")
 })
 
 test_that("a task pushed again holds the slot its old worker counted against", {

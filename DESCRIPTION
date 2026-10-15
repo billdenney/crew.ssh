@@ -15,6 +15,7 @@ Depends:
 Imports:
     crew (>= 1.3.0),
     processx,
+    ps,
     R6,
     rlang (>= 1.0.0)
 Suggests:
@@ -24,7 +25,6 @@ Suggests:
     mirai,
     nanonext,
     pkgload,
-    ps,
     rmarkdown,
     targets (>= 1.11.0),
     testthat (>= 3.0.0),
