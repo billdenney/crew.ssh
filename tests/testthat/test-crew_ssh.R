@@ -840,11 +840,14 @@ test_that("a session records itself and its tunnel on the remote system", {
   record <- read.dcf(file.path(remote, session, "session.dcf"))
   expect_identical(
     colnames(record),
-    c("session", "controller", "runtime", "local_host", "local_pid", "started")
+    c(
+      "session", "controller", "runtime", "local_host", "local_pid",
+      "local_created", "started"
+    )
   )
   expect_identical(
-    unname(record[1L, c("session", "controller", "local_pid")]),
-    c(session, "ctl", as.character(Sys.getpid()))
+    unname(record[1L, c("session", "controller", "local_pid", "local_created")]),
+    c(session, "ctl", as.character(Sys.getpid()), created_here())
   )
   expect_true(is.na(record[1L, "runtime"]) || !nzchar(record[1L, "runtime"]))
   expect_identical(
