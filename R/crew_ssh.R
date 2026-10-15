@@ -746,6 +746,10 @@ crew_class_launcher_ssh <- R6::R6Class(
     # The salvage directory is created here, by the ssh user, because a
     # worker in a container that runs as root would otherwise create it as
     # root, and the ssh user could not delete the results in it afterwards.
+    #
+    # With salvage, the workers left waiting on a task by a session whose
+    # tunnel is gone are stopped here too (see remote_stop_waiters_script()),
+    # before tunnel.pid names the new tunnel.
     tunnel_command = function() {
       directory <- private$.session_directory
       record <- c(
@@ -759,9 +763,20 @@ crew_class_launcher_ssh <- R6::R6Class(
         directory,
         if (isTRUE(private$.salvage)) private$salvage_root()
       )
+      stop_waiters <- if (isTRUE(private$.salvage)) {
+        paste0(
+          "{\n",
+          remote_stop_waiters_script(
+            remote_directory = private$.remote_directory,
+            session = private$.session
+          ),
+          "\n:; } && "
+        )
+      }
       paste0(
         "mkdir -p ", paste(shQuote(directories, type = "sh"), collapse = " "),
         " && ",
+        stop_waiters,
         "printf '%s\\n' ", paste(shQuote(record, type = "sh"), collapse = " "),
         " \"started: $(date +%s)\" > ",
         shQuote(paste0(directory, "/session.dcf"), type = "sh"), " && ",
@@ -837,6 +852,16 @@ crew_class_launcher_ssh <- R6::R6Class(
             )
           )
         }
+      }
+      stopped <- remote_stopped_waiters(private$.tunnel_output)
+      if (length(stopped)) {
+        message(
+          "crew.ssh: stopped ", length(stopped), " worker(s) on ",
+          private$.ssh_host, " that were waiting for a task running on ",
+          "another worker after their own session lost its connection. The ",
+          "worker running each task saves its result for the next push. ",
+          "Stopped: ", paste(stopped, collapse = ", ")
+        )
       }
       if (private$.verbose) {
         message(
@@ -1171,7 +1196,11 @@ crew_class_controller_ssh <- R6::R6Class(
 #'      was stopped, or the machine restarted, the heartbeat stops, and after
 #'      two minutes the new worker takes over and runs the task itself. While
 #'      this goes on, `remote_workers()` shows the old worker as `"running"`
-#'      and the new one as `"waiting"`.
+#'      and the new one as `"waiting"`. A waiting worker whose own session then
+#'      loses its connection can no longer hand the result back, so the next
+#'      session to open a tunnel to the same `remote_directory`, or the same
+#'      session when it reconnects, stops it with a message. The worker it
+#'      waited for still saves the result.
 #'
 #'   A task is identified by its name and by everything it computes from: the
 #'   command, data, globals, seed, and packages, or for a `targets` target,

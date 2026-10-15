@@ -334,7 +334,11 @@ worker dies without finishing, because it was killed, its container
 was stopped, or the machine restarted, the heartbeat stops, and after
 two minutes the new worker takes over and runs the task itself. While
 this goes on, \code{remote_workers()} shows the old worker as \code{"running"}
-and the new one as \code{"waiting"}.
+and the new one as \code{"waiting"}. A waiting worker whose own session then
+loses its connection can no longer hand the result back, so the next
+session to open a tunnel to the same \code{remote_directory}, or the same
+session when it reconnects, stops it with a message. The worker it
+waited for still saves the result.
 }
 
 A task is identified by its name and by everything it computes from: the

@@ -112,6 +112,17 @@ remote_stop_script <- function(pids, sessions, cid_files, runtimes) {
     shQuote(runtimes, type = "sh")
   )
   paste(
+    remote_stop_function(),
+    paste(calls, collapse = "\n"),
+    "exit 0",
+    sep = "\n"
+  )
+}
+
+# crew_ssh_stop PID SESSION CID_FILE RUNTIME, as remote_stop_script() and
+# remote_stop_waiters_script() use it.
+remote_stop_function <- function() {
+  paste(
     "crew_ssh_stop() {",
     "  case \"$(ps -p \"$1\" -o args= 2>/dev/null)\" in",
     "    *\"$2\"*) kill \"$1\" 2>/dev/null ;;",
@@ -121,10 +132,77 @@ remote_stop_script <- function(pids, sessions, cid_files, runtimes) {
     "  fi",
     "  return 0",
     "}",
-    paste(calls, collapse = "\n"),
-    "exit 0",
     sep = "\n"
   )
+}
+
+# Stop the workers that wait, under salvage, for a task another worker is
+# running, once the tunnel of their own session is gone. Such a worker can no
+# longer hand a result back, and the worker it waits for saves the result
+# itself, so the waiter only holds a container and its memory until that task
+# ends, which can be hours.
+#
+# This runs in the tunnel command of every session start and reconnect, before
+# the session records its new tunnel, so it sees only tunnels opened earlier.
+# `session` names the session opening the tunnel: when it reconnects, its own
+# waiters lost their connection with the old tunnel, even while the remote end
+# of that tunnel lingers because sshd has not yet noticed the client is gone.
+# A worker's task file is read just before the stop, so a waiter that has
+# since taken the task over is left running. Each stopped worker is reported on
+# a line beginning "crew-ssh-stopped-waiter:".
+remote_stop_waiters_script <- function(remote_directory, session) {
+  paste(
+    remote_stop_function(),
+    paste0("current=", shQuote(session, type = "sh")),
+    paste0(
+      "for d in ", shQuote(remote_directory, type = "sh"), "/crew-ssh-*/; do"
+    ),
+    "  [ -d \"$d\" ] || continue",
+    "  s=$(basename \"$d\")",
+    "  if [ \"$s\" != \"$current\" ] && [ -s \"${d}tunnel.pid\" ]; then",
+    "    case \"$(ps -p \"$(cat \"${d}tunnel.pid\")\" -o args= 2>/dev/null)\" in",
+    "      *\"$s\"*) continue ;;",
+    "    esac",
+    "  fi",
+    "  rt=",
+    "  if [ -f \"${d}session.dcf\" ]; then",
+    "    rt=$(sed -n 's/^runtime: //p' \"${d}session.dcf\")",
+    "  fi",
+    "  for t in \"$d\"worker-*.task; do",
+    "    [ -f \"$t\" ] || continue",
+    "    grep -qx 'task_state: waiting' \"$t\" || continue",
+    "    w=$(basename \"$t\" .task)",
+    "    pid=",
+    "    [ -s \"$d$w.pid\" ] && pid=$(cat \"$d$w.pid\")",
+    "    alive=",
+    "    case \"$(ps -p \"$pid\" -o args= 2>/dev/null)\" in",
+    "      *\"$s\"*) alive=TRUE ;;",
+    "    esac",
+    "    if [ -n \"$rt\" ] && [ -s \"$d$w.cid\" ]; then",
+    "      r=$(\"$rt\" inspect --format '{{.State.Running}}' \\",
+    "        \"$(cat \"$d$w.cid\")\" 2>/dev/null) && [ \"$r\" = true ] && alive=TRUE",
+    "    fi",
+    "    [ -n \"$alive\" ] || continue",
+    "    crew_ssh_stop \"$pid\" \"$s\" \"$d$w.cid\" \"$rt\"",
+    "    printf 'crew-ssh-stopped-waiter: %s %s %s\\n' \"$s\" \"$w\" \\",
+    "      \"$(sed -n 's/^task_name: //p' \"$t\")\"",
+    "  done",
+    "done",
+    sep = "\n"
+  )
+}
+
+# The workers remote_stop_waiters_script() reports in `output`, each as
+# "<worker> of <session> (<task>)", or without the task when its record
+# names none.
+remote_stopped_waiters <- function(output) {
+  pattern <- "^crew-ssh-stopped-waiter: (\\S+) (\\S+) ?(.*)$"
+  lines <- grep(pattern, trimws(output), value = TRUE, perl = TRUE)
+  labels <- sub(pattern, "\\2 of \\1", lines, perl = TRUE)
+  tasks <- sub(pattern, "\\3", lines, perl = TRUE)
+  named <- nzchar(tasks)
+  labels[named] <- paste0(labels[named], " (", tasks[named], ")")
+  labels
 }
 
 remote_dcf <- function(text) {

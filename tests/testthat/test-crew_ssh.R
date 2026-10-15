@@ -451,6 +451,31 @@ test_that("the tunnel command records the session and then waits on stdin", {
   )
 })
 
+test_that("with salvage, the tunnel command stops stranded waiters before recording itself", {
+  private <- crew_controller_ssh(
+    ssh_host = "user@example.com",
+    name = "ctl",
+    remote_directory = "/scratch"
+  )$launcher$.__enclos_env__$private
+  private$.session <- "crew-ssh-abc"
+  private$.session_directory <- "/scratch/crew-ssh-abc"
+  expect_identical(
+    private$tunnel_command(),
+    paste0(
+      "mkdir -p '/scratch/crew-ssh-abc' '/scratch/crew-ssh-salvage' && {\n",
+      remote_stop_waiters_script("/scratch", session = "crew-ssh-abc"),
+      "\n:; } && ",
+      "printf '%s\\n' 'session: crew-ssh-abc' 'controller: ctl' ",
+      "'runtime: ' 'local_host: ", Sys.info()[["nodename"]], "' ",
+      "'local_pid: ", Sys.getpid(), "' \"started: $(date +%s)\" > ",
+      "'/scratch/crew-ssh-abc/session.dcf' && ",
+      "echo $$ > '/scratch/crew-ssh-abc/tunnel.pid' && ",
+      "echo crew-ssh-tunnel-ready && ",
+      "exec sh -c 'cat > /dev/null; :' 'crew-ssh-abc'"
+    )
+  )
+})
+
 test_that("salvage_task() leaves a task alone without salvage or a name", {
   launcher <- crew_controller_ssh(
     ssh_host = "user@example.com",
