@@ -1693,11 +1693,11 @@ test_that("backlog_first() picks the unpushed tasks with a run going or a saved 
   )
 })
 
-# A controller with an empty backlog, as start() makes it, without the tunnel
-# that start() opens.
+# A controller with an empty backlog but no tunnel. crew's terminate() gives
+# an unstarted controller the empty backlog that start() would.
 backlog_controller <- function(...) {
   controller <- crew_controller_ssh(ssh_host = "fakehost", ...)
-  controller$.__enclos_env__$private$.queue_backlog <- collections::queue()
+  controller$terminate()
   controller
 }
 
