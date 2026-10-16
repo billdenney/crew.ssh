@@ -229,8 +229,11 @@ crew_class_launcher_ssh <- R6::R6Class(
       )
       private$.handles <- list()
       private$.disconnected <- character(0L)
-      private$.unreachable <- private$.unreachable[0L, , drop = FALSE]
+      private$.unreachable <- remote_unreachable_none()
       private$.unreachable_checked <- -Inf
+      private$.obsolete_tried <- -Inf
+      private$.salvage_saved <- character(0L)
+      private$.salvage_passes <- character(0L)
       # Hashed environments, because a pipeline may push and collect hundreds
       # of thousands of tasks, and growing a vector costs a copy each time.
       private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
@@ -268,8 +271,10 @@ crew_class_launcher_ssh <- R6::R6Class(
     #' @description Launch workers to match the tasks pushed so far.
     #' @details As in `crew`, except that with `salvage = TRUE`, tasks still
     #'   running on workers this controller cannot reach count against
-    #'   `workers` until they finish or this controller pushes them again.
-    #'   See the "Surviving a disconnect" section of [crew_controller_ssh()].
+    #'   `workers` until they finish or a worker of this controller takes them
+    #'   over, and those that run an earlier version of a task this controller
+    #'   has pushed are stopped. See the "Surviving a disconnect" section of
+    #'   [crew_controller_ssh()].
     #' @return `TRUE` if it launched workers, `FALSE` otherwise, invisibly.
     #' @param status A list of task and connection counts from the `crew`
     #'   client.
@@ -502,14 +507,15 @@ crew_class_launcher_ssh <- R6::R6Class(
         !(".crew_ssh_salvage" %in% names(data)),
         message = "the data of a task must not contain .crew_ssh_salvage."
       )
-      if (!identical(globals, private$.salvage_globals)) {
-        private$.salvage_globals <- globals
-        private$.salvage_globals_hash <- salvage_globals_hash(globals)
+      cache <- private$.salvage_globals
+      if (is.null(cache) || !identical(globals, cache$globals)) {
+        private$.salvage_globals <- salvage_globals_cache(globals)
       }
+      private$.salvage_passes <- setdiff(private$.salvage_passes, name)
       key <- salvage_key(
         command = command,
         data = data,
-        globals_hash = private$.salvage_globals_hash,
+        globals = private$.salvage_globals,
         seed = seed,
         algorithm = algorithm,
         packages = packages,
@@ -588,15 +594,61 @@ crew_class_launcher_ssh <- R6::R6Class(
       }
       invisible()
     },
-    #' @description Terminate the launcher: stop remote workers, delete the
-    #'   saved results this session collected, and close the reverse `ssh`
-    #'   tunnel.
-    #' @details Termination stops workers mid-task, including with
-    #'   `salvage = TRUE`: a disconnect lets a worker finish and save its task,
-    #'   but terminating the controller is a request to stop.
+    #' @description Choose the tasks of a backlog that have something saved
+    #'   or running from an earlier session, so they are pushed first. The
+    #'   controller calls this from `pop_backlog()`; it is not meant to be
+    #'   called directly.
+    #' @details A task of this kind is cheap to push: a saved result comes back
+    #'   at once, a run of the same task is waited for instead of repeated, and
+    #'   a run of an earlier version of it is stopped as soon as the new version
+    #'   is pushed, which frees its slot. Until the task is pushed, none of that
+    #'   can happen, because only the push gives its key. The tasks chosen are
+    #'   pushed even when the controller is saturated (see `salvage_passing()`).
+    #'   The choice uses only what the controller last read from the remote
+    #'   system, so it costs no `ssh` call.
+    #' @return Character vector, the names in `names` to push first, in their
+    #'   order there.
+    #' @param names Character vector, the names of the tasks in the backlog,
+    #'   in order.
+    salvage_backlog = function(names) {
+      private$.salvage_passes <- character(0L)
+      if (!isTRUE(private$.salvage) || !length(names)) {
+        return(character(0L))
+      }
+      first <- backlog_first(
+        names = names,
+        running = private$.unreachable$task_name,
+        saved = private$.salvage_saved,
+        keys = private$.salvage_keys
+      )
+      private$.salvage_passes <- first
+      first
+    },
+    #' @description Whether a task chosen by `salvage_backlog()` is still to
+    #'   be pushed. The controller calls this from `saturated()`; it is not
+    #'   meant to be called directly.
+    #' @details `targets` asks whether the controller is saturated before it
+    #'   pushes each task, and keeps the task back if it is. A chosen task is
+    #'   let through, and its push clears it.
+    #' @return `TRUE` or `FALSE`.
+    salvage_passing = function() {
+      length(private$.salvage_passes) > 0L
+    },
+    #' @description Terminate the launcher: stop the remote workers that are
+    #'   not busy, delete the saved results this session collected, and close
+    #'   the reverse `ssh` tunnel.
+    #' @details Without salvage, every worker is stopped. With
+    #'   `salvage = TRUE`, a worker in the middle of a task is left to finish
+    #'   it and save the result, as after a disconnect, and the rest are
+    #'   stopped. A pipeline stopped part way through, whether interrupted or
+    #'   halted by an error, therefore keeps its remote work: a later session
+    #'   reuses each saved result, waits for a task still running, and stops a
+    #'   run whose task has changed since (see the "Surviving a disconnect"
+    #'   section of [crew_controller_ssh()]). `terminate_orphans()`, called
+    #'   from a later session, stops the workers left running.
     #' @return `NULL` (invisibly).
     terminate = function() {
-      private$workers_stop()
+      private$workers_stop(keep_running = isTRUE(private$.salvage))
       private$salvage_flush(wait = TRUE)
       private$tunnel_stop()
       super$terminate()
@@ -627,14 +679,13 @@ crew_class_launcher_ssh <- R6::R6Class(
     .disconnected = character(0L),
     # Tasks running on workers this controller cannot reach (see
     # unreachable_busy()), when they were last read, and how often to read
-    # them, in seconds.
-    .unreachable = data.frame(
-      task_key = character(0L),
-      task_name = character(0L),
-      stringsAsFactors = FALSE
-    ),
+    # them, in seconds; and when this controller last tried to stop the ones
+    # that run an earlier version of a task it pushed (see
+    # unreachable_obsolete()).
+    .unreachable = NULL,
     .unreachable_checked = -Inf,
     .unreachable_seconds = 30,
+    .obsolete_tried = -Inf,
     .tunnel = NULL,
     .tunnel_port = NULL,
     .tunnel_output = character(0L),
@@ -643,8 +694,13 @@ crew_class_launcher_ssh <- R6::R6Class(
     # one checks back, in seconds.
     .salvage_seconds = c(heartbeat = 15, stale = 120, poll = 10),
     .salvage_shipped = NULL,
+    # A salvage_globals_cache() of the globals last pushed.
     .salvage_globals = NULL,
-    .salvage_globals_hash = NULL,
+    # Keys of the results saved in the salvage directory, as last read with
+    # the unreachable tasks.
+    .salvage_saved = character(0L),
+    # Tasks salvage_backlog() chose that are still to be pushed.
+    .salvage_passes = character(0L),
     .salvage_keys = NULL,
     .salvage_collected = NULL,
     .salvage_pending = character(0L),
@@ -710,7 +766,8 @@ crew_class_launcher_ssh <- R6::R6Class(
         script = paste0(base, ".R"),
         log = paste0(base, ".log"),
         pid = paste0(base, ".pid"),
-        cid = paste0(base, ".cid")
+        cid = paste0(base, ".cid"),
+        task = paste0(base, ".task")
       )
     },
     # Shell command that receives the worker script on stdin, detaches an
@@ -1116,13 +1173,14 @@ crew_class_launcher_ssh <- R6::R6Class(
       )
     },
     # The number of tasks running on workers this controller cannot reach, as
-    # remote_unreachable_tasks() finds them, less those this session has
-    # pushed again: the worker that takes such a task holds a slot of its own
-    # while it hands back the saved result or waits for the running one. The
-    # remote records are read only when crew might launch a worker, with more
-    # tasks than connected workers, and at most every .unreachable_seconds. A
-    # read that fails, as when the network is down, leaves the last count
-    # standing.
+    # remote_unreachable_tasks() finds them, that count against `workers` (see
+    # unreachable_count()). A task pushed again with a different key is
+    # stopped instead (see unreachable_obsolete()). The remote records, and
+    # with them the keys of the saved results, are read only when crew might
+    # launch a worker, with more tasks than connected workers, or while a
+    # task pushed again under the same key has not been seen taken over, and
+    # at most every .unreachable_seconds. A read that fails, as when the
+    # network is down, leaves the last count standing.
     unreachable_busy = function(status) {
       if (!isTRUE(private$.salvage) || is.null(private$.session)) {
         return(0L)
@@ -1130,28 +1188,89 @@ crew_class_launcher_ssh <- R6::R6Class(
       tasks <- .subset2(status, "awaiting") + .subset2(status, "executing")
       due <- as.numeric(Sys.time()) - private$.unreachable_checked >=
         private$.unreachable_seconds
-      if (due && tasks > .subset2(status, "connections")) {
+      wanted <- tasks > .subset2(status, "connections") ||
+        private$unreachable_pending()
+      if (due && wanted) {
         private$.unreachable_checked <- as.numeric(Sys.time())
         out <- private$run(
           command = remote_workers_script(
             private$.remote_directory,
-            states = c("running", "waiting")
+            states = c("running", "waiting"),
+            saved = private$salvage_root()
           ),
           timeout = min(private$.seconds_timeout, private$.unreachable_seconds)
         )
         if (identical(out$status, 0L)) {
+          parts <- remote_workers_split(out$stdout)
+          private$.salvage_saved <- parts$saved
           private$unreachable_update(
-            remote_unreachable_tasks(
-              workers = private$workers_frame(out$stdout),
+            runs = remote_unreachable_tasks(
+              workers = private$workers_frame(parts$workers),
               disconnected = private$.disconnected
-            )
+            ),
+            tasks = tasks
           )
         }
       }
-      private$unreachable_unpushed()
+      private$unreachable_obsolete()
+      private$unreachable_count(tasks)
     },
-    unreachable_unpushed = function() {
+    # How many of the unreachable runs count against `workers`, with `tasks`
+    # the number of tasks this session has yet to finish. A run counts until
+    # a reachable worker of this session takes its task over, waiting for it
+    # or handing back its saved result, and that worker then holds the slot.
+    # A run whose task this session has pushed again, under the same key,
+    # gives its slot to that push only when every task this session has yet
+    # to finish is such a push: the next worker crew launches then takes one
+    # of them and waits instead of starting other work. While other tasks
+    # wait too, mirai may give that worker one of those, and the old run goes
+    # on all the same, so it counts until its own push is taken.
+    unreachable_count = function(tasks) {
+      runs <- private$.unreachable
+      if (is.null(runs) || !nrow(runs)) {
+        return(0L)
+      }
+      counted <- !runs$claimed
+      repushed <- private$unreachable_repushed()
+      if (tasks > 0L && tasks == sum(repushed)) {
+        counted <- counted & !repushed
+      }
+      sum(counted)
+    },
+    # Which unreachable runs this session has pushed again under the same key.
+    unreachable_repushed = function() {
+      runs <- private$.unreachable
+      pushed <- vapply(
+        runs$task_name,
+        pushed_key,
+        character(1L),
+        keys = private$.salvage_keys,
+        USE.NAMES = FALSE
+      )
+      !is.na(pushed) & pushed == runs$task_key
+    },
+    # Whether this session has pushed a task again, under the same key, that
+    # no worker of it has been seen to take over: a worker may have taken it
+    # since, which only the remote records tell.
+    unreachable_pending = function() {
+      runs <- private$.unreachable
+      if (is.null(runs) || !nrow(runs)) {
+        return(FALSE)
+      }
+      any(!runs$claimed & private$unreachable_repushed())
+    },
+    # Stop the unreachable workers that run an earlier version of a task this
+    # controller has pushed: the same name under a different key computed the
+    # same way. A worker of another session is unreachable only once that
+    # session is gone, so this never stops the work of a live session. A task
+    # whose key was computed another way is left to finish, since its key
+    # says nothing about whether the task changed. A stop that fails is tried
+    # again after .unreachable_seconds.
+    unreachable_obsolete = function() {
       tasks <- private$.unreachable
+      if (!nrow(tasks)) {
+        return(invisible())
+      }
       pushed <- vapply(
         tasks$task_name,
         pushed_key,
@@ -1159,21 +1278,52 @@ crew_class_launcher_ssh <- R6::R6Class(
         keys = private$.salvage_keys,
         USE.NAMES = FALSE
       )
-      sum(is.na(pushed) | pushed != tasks$task_key)
-    },
-    unreachable_update = function(tasks) {
-      if (identical(tasks$task_key, private$.unreachable$task_key)) {
+      obsolete <- !is.na(pushed) &
+        pushed != tasks$task_key &
+        tasks$task_scheme %in% salvage_scheme
+      due <- as.numeric(Sys.time()) - private$.obsolete_tried >=
+        private$.unreachable_seconds
+      if (!any(obsolete) || !due) {
         return(invisible())
       }
-      private$.unreachable <- tasks
-      if (nrow(tasks)) {
+      private$.obsolete_tried <- as.numeric(Sys.time())
+      out <- private$run(
+        command = remote_stop_obsolete_script(
+          tasks = tasks[obsolete, , drop = FALSE],
+          salvage_directory = private$salvage_root()
+        ),
+        timeout = private$.seconds_timeout
+      )
+      if (!identical(out$status, 0L)) {
+        return(invisible())
+      }
+      private$.unreachable <- tasks[!obsolete, , drop = FALSE]
+      stopped <- remote_stopped_obsolete(out$stdout)
+      if (length(stopped)) {
         message(
-          "crew.ssh: ", nrow(tasks), " task(s) are still running on workers ",
+          "crew.ssh: stopped ", paste(stopped, collapse = ", "), " on ",
+          private$.ssh_host, ": each ran an earlier version of a task that ",
+          "this controller has pushed again with different inputs, so ",
+          "nothing would collect its result."
+        )
+      }
+      invisible()
+    },
+    unreachable_update = function(runs, tasks) {
+      same <- identical(runs$task_key, private$.unreachable$task_key)
+      private$.unreachable <- runs
+      if (same) {
+        return(invisible())
+      }
+      if (nrow(runs)) {
+        message(
+          "crew.ssh: ", nrow(runs), " task(s) are still running on workers ",
           "of ", private$.ssh_host, " that this controller cannot reach (",
-          paste(tasks$task_name, collapse = ", "), "). Until they finish or ",
-          "this controller pushes them again, they count against its ",
-          private$.workers, " worker(s), so it launches at most ",
-          max(0L, private$.workers - private$unreachable_unpushed()), "."
+          paste(runs$task_name, collapse = ", "), "). Until each finishes or ",
+          "a worker of this controller takes its task over, this controller ",
+          "launches at most ",
+          max(0L, private$.workers - private$unreachable_count(tasks)),
+          " of its ", private$.workers, " worker(s)."
         )
       } else {
         message(
@@ -1199,23 +1349,45 @@ crew_class_launcher_ssh <- R6::R6Class(
         call
       )
     },
-    workers_stop = function() {
+    # Stop this session's workers, or with keep_running = TRUE, those not in
+    # the middle of a task.
+    workers_stop = function(keep_running = FALSE) {
       handles <- private$.handles
       if (!length(handles)) {
         return(invisible())
       }
       names <- names(handles)
+      paths <- private$worker_paths(names)
       command <- remote_stop_script(
         pids = vapply(handles, "[[", character(1L), "pid"),
         sessions = rep(private$.session, length(names)),
-        cid_files = private$worker_paths(names)$cid,
-        runtimes = rep(private$runtime_name(), length(names))
+        cid_files = paths$cid,
+        runtimes = rep(private$runtime_name(), length(names)),
+        task_files = if (keep_running) paths$task else NULL,
+        ended = if (keep_running) {
+          paste0(private$.session_directory, "/ended")
+        } else {
+          NULL
+        }
       )
-      try(
+      out <- try(
         private$run(command = command, timeout = private$.seconds_timeout),
         silent = TRUE
       )
       private$.handles <- list()
+      kept <- if (inherits(out, "try-error")) {
+        character(0L)
+      } else {
+        remote_kept_workers(out$stdout)
+      }
+      if (length(kept)) {
+        message(
+          "crew.ssh: left ", paste(kept, collapse = ", "), " running on ",
+          private$.ssh_host, " to finish and save its task. A later session ",
+          "reuses each result, or stops a run whose task has changed by ",
+          "then; terminate_orphans() from a later session stops them now."
+        )
+      }
       invisible()
     },
     salvage_root = function() {
@@ -1361,6 +1533,32 @@ crew_class_controller_ssh <- R6::R6Class(
         save_command = save_command,
         controller = controller
       )
+    },
+    # The tasks of the backlog that an earlier session has saved or still
+    # runs go out first, ahead of the backlog's order and even when the
+    # controller is saturated (see the launcher's salvage_backlog()). The
+    # backlog keeps the rest in their order.
+    pop_backlog = function(controllers = NULL) {
+      backlog <- .subset2(.queue_backlog, "as_list")()
+      names <- as.character(unlist(backlog, use.names = FALSE))
+      first <- .subset2(.launcher, "salvage_backlog")(names)
+      if (length(first)) {
+        .subset2(.queue_backlog, "clear")()
+        for (name in names[!(names %in% first)]) {
+          .subset2(.queue_backlog, "push")(name)
+        }
+      }
+      c(first, super$pop_backlog(controllers = controllers))
+    },
+    saturated = function(collect = NULL, throttle = NULL, controller = NULL) {
+      if (.subset2(.launcher, "salvage_passing")()) {
+        return(FALSE)
+      }
+      super$saturated(
+        collect = collect,
+        throttle = throttle,
+        controller = controller
+      )
     }
   ),
   private = list(
@@ -1485,10 +1683,33 @@ crew_class_controller_ssh <- R6::R6Class(
 #'      was reopened, takes up the remote system as much as a connected
 #'      worker does, so it counts against `workers` until it finishes: the
 #'      controller launches only as many workers as are left, and says so.
-#'      Once the same task is pushed again, the worker that takes it holds
-#'      the slot instead, while it hands back the saved result or waits for
-#'      the running one. The controller reads the remote records for this at
-#'      most every 30 seconds.
+#'      Once a worker of this controller takes the same task over, waiting
+#'      for the running one or handing back its saved result, that worker
+#'      holds the slot instead. When pushes of such tasks are all the work
+#'      this controller has waiting, the slot goes to them at once, since the
+#'      next worker launched can only take one of them; while other tasks
+#'      wait too, that worker might take one of those, so the old run counts
+#'      until its own push is taken. The controller reads the remote records
+#'      for this at most every 30 seconds.
+#'   6. When the controller pushes a task under the name of a task that such
+#'      a worker runs, but with a different key, the task has changed since
+#'      that run began: its command, the data it depends on, or a global it
+#'      uses. Nothing will collect the old run's result, so the controller
+#'      stops that worker, says so, and frees its slot. A run whose key was
+#'      computed by a crew.ssh from before keys recorded how they were
+#'      computed is left to finish.
+#'   7. Tasks an earlier session has saved or still runs go first. When
+#'      `targets` holds tasks back because the controller is saturated, the
+#'      controller pushes those ahead of the rest, even while saturated, so a
+#'      saved result comes back, a run in progress is waited for, and a
+#'      changed one is stopped without waiting for a free slot. Which tasks
+#'      these are comes from the same remote records.
+#'   8. Terminating the controller, which `targets` does when a pipeline ends,
+#'      is interrupted, or stops on an error, stops the idle workers but
+#'      leaves a worker in the middle of a task to finish and save it, as
+#'      after a disconnect. The next session then reuses, waits for, or stops
+#'      each of these runs by the rules above. `terminate_orphans()`, called
+#'      from a later session, stops them all at once.
 #'
 #'   A session is gone when the remote end of its tunnel has stopped, or,
 #'   for a session started on the same machine, when the R process that
@@ -1511,10 +1732,15 @@ crew_class_controller_ssh <- R6::R6Class(
 #'
 #'   A task is identified by its name and by everything it computes from: the
 #'   command, data, globals, seed, and packages, or for a `targets` target,
-#'   its command, seed, settings, and the hashes of the data it depends on. A
-#'   task pushed without a name, as `push()` allows, runs without salvage.
-#'   Salvage assumes a task gives the same result each time it runs with the
-#'   same inputs, which `targets` arranges by seeding every target.
+#'   its command, seed, settings, the hashes of the data it depends on, and
+#'   the globals it uses, directly or through the global functions it calls,
+#'   found the way `targets` finds them. A change to any other global, such as
+#'   an unrelated function in `_targets.R`, leaves the key as it was, just as
+#'   it leaves the target up to date for `targets`; so does a change to the
+#'   pipeline's options, such as its controller. A task pushed without a name,
+#'   as `push()` allows, runs without salvage. Salvage assumes a task gives
+#'   the same result each time it runs with the same inputs, which `targets`
+#'   arranges by seeding every target.
 #'
 #'   A saved result is deleted once a controller collects it with `pop()`,
 #'   `collect()`, or `map()`. Results nothing collects stay until the
@@ -1694,6 +1920,38 @@ crew_controller_ssh <- function(
 reconnect_pause <- function(tries, remaining, first, longest, jitter) {
   pause <- min(longest, first * 2^(tries - 1L)) * (0.8 + 0.4 * jitter)
   min(remaining, longest, pause)
+}
+
+# The names in a backlog, `names`, that this session has not pushed (`keys`,
+# as in pushed_key()) and that have a run going on a worker of an earlier
+# session (`running`, task names) or a saved result (`saved`, keys). A saved
+# result counts by the prefix of its key, so it may be from an earlier version
+# of the task, which then runs again; pushing it first costs nothing either
+# way.
+backlog_first <- function(names, running, saved, keys) {
+  prefixes <- paste0(
+    vapply(names, salvage_prefix, character(1L), USE.NAMES = FALSE),
+    "-"
+  )
+  has_saved <- vapply(
+    prefixes,
+    prefix_found,
+    logical(1L),
+    keys = saved,
+    USE.NAMES = FALSE
+  )
+  pushed <- !is.na(vapply(
+    names,
+    pushed_key,
+    character(1L),
+    keys = keys,
+    USE.NAMES = FALSE
+  ))
+  names[(names %in% running | has_saved) & !pushed]
+}
+
+prefix_found <- function(prefix, keys) {
+  any(startsWith(keys, prefix))
 }
 
 # The salvage key under which this session pushed the task called `name` and

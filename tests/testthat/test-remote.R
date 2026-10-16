@@ -52,8 +52,9 @@ test_that("remote_workers_frame() types every column, even with no workers", {
       local_host = "character", local_pid = "integer",
       local_created = "numeric",
       task_key = "character", task_name = "character",
-      task_state = "character", task_started = "POSIXct",
-      task_ended = "POSIXct", task_updated = "POSIXct"
+      task_state = "character", task_scheme = "integer",
+      task_started = "POSIXct", task_ended = "POSIXct",
+      task_updated = "POSIXct"
     )
   )
   text <- paste(
@@ -72,6 +73,7 @@ test_that("remote_workers_frame() types every column, even with no workers", {
     "task_name: fit",
     "task_state: running",
     "task_updated: 1790000000.500",
+    "task_scheme: 2",
     "task_started: 1790000000.250",
     "",
     sep = "\n"
@@ -88,6 +90,7 @@ test_that("remote_workers_frame() types every column, even with no workers", {
   expect_identical(frame$local_created, 1790000000.125)
   expect_identical(as.numeric(frame$task_started), 1790000000.25)
   expect_true(is.na(frame$task_ended))
+  expect_identical(frame$task_scheme, 2L)
 })
 
 test_that("remote_workers_script() reads the records of every session", {
@@ -169,6 +172,148 @@ test_that("remote_stop_script() stops only processes that still name their sessi
   # Its PID names another session, so it is not this worker any more.
   expect_true(other$is_alive())
   expect_identical(readLines(log), "kill cid-a")
+})
+
+# Write the task record of `worker` in `directory` and return its path.
+task_record <- function(directory, worker, state, key = "k-1",
+                        name = paste("fit", worker)) {
+  path <- file.path(directory, paste0(worker, ".task"))
+  writeLines(
+    c(paste("task_key:", key), paste("task_name:", name), paste("task_state:", state)),
+    path
+  )
+  path
+}
+
+test_that("remote_stop_script() with task records leaves busy workers running", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  busy <- process_naming("crew-ssh-mine")
+  idle <- process_naming("crew-ssh-mine")
+  waiter <- process_naming("crew-ssh-mine")
+  on.exit({
+    busy$kill()
+    idle$kill()
+    waiter$kill()
+  })
+  ended <- file.path(remote, "ended")
+  output <- run_sh(
+    remote_stop_script(
+      pids = c(busy$get_pid(), idle$get_pid(), waiter$get_pid()),
+      sessions = rep("crew-ssh-mine", 3L),
+      cid_files = file.path(remote, c("a.cid", "b.cid", "c.cid")),
+      runtimes = rep(NA, 3L),
+      task_files = c(
+        task_record(remote, "worker-a", "running"),
+        task_record(remote, "worker-b", "success"),
+        task_record(remote, "worker-c", "waiting")
+      ),
+      ended = ended
+    )
+  )
+  wait_until(!idle$is_alive() && !waiter$is_alive(), seconds = 10)
+  expect_true(busy$is_alive())
+  expect_true(file.exists(ended))
+  expect_identical(remote_kept_workers(output), "worker-a (fit worker-a)")
+})
+
+test_that("remote_stop_obsolete_script() stops a run only while it still runs that key", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  salvage <- file.path(remote, "crew-ssh-salvage")
+  dir.create(salvage)
+  session <- file.path(remote, "crew-ssh-old")
+  dir.create(session)
+  obsolete <- process_naming("crew-ssh-old")
+  moved_on <- process_naming("crew-ssh-old")
+  on.exit({
+    obsolete$kill()
+    moved_on$kill()
+  })
+  writeLines(
+    c("task_key: fit-old", "task_name: fit", "task_state: running"),
+    file.path(session, "worker-a.task")
+  )
+  # This worker's record shows it on another key since the controller read it.
+  writeLines(
+    c("task_key: fit-other", "task_name: fit", "task_state: running"),
+    file.path(session, "worker-b.task")
+  )
+  dir.create(file.path(salvage, "fit-old.lock"))
+  dir.create(file.path(salvage, "fit-stale.lock"))
+  tasks <- data.frame(
+    task_key = c("fit-old", "fit-stale"),
+    task_name = "fit",
+    task_scheme = 2L,
+    session = "crew-ssh-old",
+    session_directory = session,
+    worker = c("worker-a", "worker-b"),
+    pid = c(obsolete$get_pid(), moved_on$get_pid()),
+    runtime = NA_character_,
+    claimed = FALSE,
+    stringsAsFactors = FALSE
+  )
+  output <- run_sh(remote_stop_obsolete_script(tasks, salvage))
+  wait_until(!obsolete$is_alive(), seconds = 10)
+  expect_true(moved_on$is_alive())
+  expect_false(dir.exists(file.path(salvage, "fit-old.lock")))
+  expect_true(dir.exists(file.path(salvage, "fit-stale.lock")))
+  expect_identical(remote_stopped_obsolete(output), "worker-a of crew-ssh-old (fit)")
+})
+
+test_that("remote_reported() reads tagged lines, with or without a task", {
+  output <- c(
+    "noise",
+    "crew-ssh-kept-worker: worker-1 fit_pk_1",
+    "  crew-ssh-kept-worker: worker-2 ",
+    "crew-ssh-stopped-obsolete: crew-ssh-a worker-3 fit two words",
+    "crew-ssh-stopped-obsolete: crew-ssh-b worker-4"
+  )
+  expect_identical(
+    remote_kept_workers(output),
+    c("worker-1 (fit_pk_1)", "worker-2")
+  )
+  expect_identical(
+    remote_stopped_obsolete(output),
+    c("worker-3 of crew-ssh-a (fit two words)", "worker-4 of crew-ssh-b")
+  )
+  expect_identical(remote_kept_workers(character(0L)), character(0L))
+})
+
+test_that("remote_workers_split() separates the workers from the saved keys", {
+  expect_identical(
+    remote_workers_split("a: 1\n\ncrew-ssh-saved:\nfit-1\n\nother-2\n"),
+    list(workers = "a: 1\n", saved = c("fit-1", "other-2"))
+  )
+  expect_identical(
+    remote_workers_split("a: 1\n"),
+    list(workers = "a: 1\n", saved = character(0L))
+  )
+  expect_identical(
+    remote_workers_split("crew-ssh-saved:\n"),
+    list(workers = "", saved = character(0L))
+  )
+})
+
+test_that("remote_workers_script() lists the saved keys after the workers", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  salvage <- file.path(remote, "crew-ssh-salvage")
+  dir.create(salvage)
+  file.create(file.path(salvage, c("fit-1.rds", "other-2.rds")))
+  dir.create(file.path(salvage, "lock-3.lock"))
+  parts <- remote_workers_split(
+    run_sh(remote_workers_script(remote, saved = salvage))
+  )
+  expect_identical(parts$workers, "")
+  expect_setequal(parts$saved, c("fit-1", "other-2"))
+  empty <- remote_tempdir()
+  expect_identical(
+    remote_workers_split(
+      run_sh(remote_workers_script(empty, saved = file.path(empty, "none")))
+    )$saved,
+    character(0L)
+  )
 })
 
 # The records of a session as its tunnel command writes them. `tunnel_pid`
@@ -297,22 +442,6 @@ test_that("remote_workers_script() can skip workers by the state of their task",
   )
 })
 
-# One record in the format remote_workers_script() prints.
-worker_record <- function(session, session_alive, worker, alive, state,
-                          key = NA, name = NA) {
-  c(
-    paste("session:", session),
-    paste("session_alive:", session_alive),
-    paste("worker:", worker),
-    "pid: 1",
-    paste("process_alive:", alive),
-    if (!is.na(key)) paste("task_key:", key),
-    if (!is.na(name)) paste("task_name:", name),
-    paste("task_state:", state),
-    ""
-  )
-}
-
 test_that("remote_unreachable_tasks() finds the running tasks no connection reaches", {
   text <- paste(
     c(
@@ -333,7 +462,9 @@ test_that("remote_unreachable_tasks() finds the running tasks no connection reac
       # A running record without a key cannot be matched to anything.
       worker_record("crew-ssh-dead", "FALSE", "worker-h", "TRUE", "running"),
       # A finished task takes up nothing.
-      worker_record("crew-ssh-me", "TRUE", "worker-i", "TRUE", "success", "done-7", "done")
+      worker_record("crew-ssh-me", "TRUE", "worker-i", "TRUE", "success", "done-7", "done"),
+      # A run whose key a crew.ssh wrote before keys recorded how.
+      worker_record("crew-ssh-dead", "FALSE", "worker-j", "TRUE", "running", "v1-8", "v1", scheme = NA)
     ),
     collapse = "\n"
   )
@@ -341,25 +472,59 @@ test_that("remote_unreachable_tasks() finds the running tasks no connection reac
   expect_identical(
     remote_unreachable_tasks(workers, disconnected = c("worker-f", "worker-i")),
     data.frame(
-      task_key = c("fit-1", "old-5"),
-      task_name = c("fit", "old"),
+      task_key = c("fit-1", "old-5", "v1-8"),
+      task_name = c("fit", "old", "v1"),
+      task_scheme = c(2L, 2L, NA),
+      session = c("crew-ssh-dead", "crew-ssh-me", "crew-ssh-dead"),
+      session_directory = c(
+        "/remote/crew-ssh-dead", "/remote/crew-ssh-me", "/remote/crew-ssh-dead"
+      ),
+      worker = c("worker-a", "worker-f", "worker-j"),
+      pid = c(1L, 1L, 1L),
+      runtime = NA_character_,
+      claimed = FALSE,
       stringsAsFactors = FALSE
     )
   )
   # Without the reopen, this session's worker is reachable.
   expect_identical(
     remote_unreachable_tasks(workers, disconnected = character(0L))$task_key,
-    "fit-1"
+    c("fit-1", "v1-8")
   )
   none <- remote_workers_frame("", "host", "/remote", session = "crew-ssh-me")
   expect_identical(
     remote_unreachable_tasks(none, disconnected = character(0L)),
-    data.frame(
-      task_key = character(0L),
-      task_name = character(0L),
-      stringsAsFactors = FALSE
+    remote_unreachable_none()
+  )
+  expect_identical(nrow(remote_unreachable_none()), 0L)
+  expect_identical(
+    names(remote_unreachable_none()),
+    c(
+      "task_key", "task_name", "task_scheme", "session", "session_directory",
+      "worker", "pid", "runtime", "claimed"
     )
   )
+})
+
+test_that("a task is claimed once a reachable worker of this session holds it", {
+  text <- paste(
+    c(
+      worker_record("crew-ssh-dead", "FALSE", "worker-a", "TRUE", "running", "fit-1", "fit"),
+      worker_record("crew-ssh-dead", "FALSE", "worker-b", "TRUE", "running", "map-2", "map"),
+      worker_record("crew-ssh-dead", "FALSE", "worker-c", "TRUE", "running", "sum-3", "sum"),
+      # This session's worker waits for fit-1, so it holds that task now.
+      worker_record("crew-ssh-me", "TRUE", "worker-d", "TRUE", "waiting", "fit-1", "fit"),
+      # A worker cut off from this session holds nothing for it.
+      worker_record("crew-ssh-me", "TRUE", "worker-e", "TRUE", "waiting", "map-2", "map"),
+      # A worker of another live session is not this session's.
+      worker_record("crew-ssh-live", "TRUE", "worker-f", "TRUE", "waiting", "sum-3", "sum")
+    ),
+    collapse = "\n"
+  )
+  workers <- remote_workers_frame(text, "host", "/remote", session = "crew-ssh-me")
+  tasks <- remote_unreachable_tasks(workers, disconnected = "worker-e")
+  expect_identical(tasks$task_key, c("fit-1", "map-2", "sum-3"))
+  expect_identical(tasks$claimed, c(TRUE, FALSE, FALSE))
 })
 
 test_that("remote_stopped_waiters() reads the workers the tunnel reports stopping", {
@@ -588,4 +753,26 @@ test_that("remote_stop_waiters_script() treats sessions known to have ended as g
   # A session not known to have ended still goes by its tunnel.
   expect_true(live_tunnel$is_alive())
   expect_true(live_waiter$is_alive())
+})
+
+test_that("a session that left an ended marker counts as gone", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  tunnel <- process_naming("crew-ssh-left")
+  worker <- process_naming("crew-ssh-left")
+  on.exit({
+    tunnel$kill()
+    worker$kill()
+  })
+  directory <- write_session_records(remote, "crew-ssh-left", tunnel$get_pid())
+  write_worker_records(directory, "worker-a", worker$get_pid(), "running", "fit")
+  frame <- function() {
+    remote_workers_frame(
+      run_sh(remote_workers_script(remote)),
+      "host", remote, session = NULL
+    )
+  }
+  expect_true(frame()$session_alive)
+  file.create(file.path(directory, "ended"))
+  expect_false(frame()$session_alive)
 })

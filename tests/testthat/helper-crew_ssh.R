@@ -419,12 +419,12 @@ identity_key <- function(source) {
     crew_ssh_load(source)
   }
   key <- get("salvage_key", envir = asNamespace("crew.ssh"))
-  hash <- get("salvage_globals_hash", envir = asNamespace("crew.ssh"))
+  cache <- get("salvage_globals_cache", envir = asNamespace("crew.ssh"))
   payload <- identity_payload()
   key(
     command = payload$command,
     data = payload$data,
-    globals_hash = hash(payload$globals),
+    globals = cache(payload$globals),
     seed = 1L,
     algorithm = NULL,
     packages = character(0L),
@@ -462,11 +462,12 @@ pipeline_header <- function(remote) {
 }
 
 # A pipeline with one remote target that holds until the file `release`
-# exists.
-write_pipeline <- function(project, remote, multiplier) {
+# exists. `unrelated` changes a function that no target uses.
+write_pipeline <- function(project, remote, multiplier, unrelated = 1) {
   writeLines(
     c(
       pipeline_header(remote),
+      sprintf("unrelated_helper <- function(x) x + %s", unrelated),
       sprintf(
         paste(
           "slow_fit <- function(x) {",
@@ -525,4 +526,83 @@ interrupted_pipeline <- function(project) {
   first <- make_pipeline(project, background = TRUE)
   wait_until(file.exists(file.path(project, "fits.txt")), seconds = 120)
   first$kill()
+}
+
+# Remote records ----
+
+# One record in the format remote_workers_script() prints.
+worker_record <- function(session, session_alive, worker, alive, state,
+                          key = NA, name = NA, scheme = 2L) {
+  c(
+    paste("session:", session),
+    paste("session_alive:", session_alive),
+    paste("worker:", worker),
+    "pid: 1",
+    paste("process_alive:", alive),
+    if (!is.na(key)) paste("task_key:", key),
+    if (!is.na(name)) paste("task_name:", name),
+    paste("task_state:", state),
+    if (!is.na(scheme)) paste("task_scheme:", scheme),
+    ""
+  )
+}
+
+# Runs left behind ----
+
+# The process IDs of the workers under `remote`, named by worker.
+worker_pids <- function(remote) {
+  files <- list.files(remote, "^worker-.*\\.pid$", recursive = TRUE, full.names = TRUE)
+  stats::setNames(
+    as.integer(vapply(files, readLines, character(1L))),
+    sub("\\.pid$", "", basename(files))
+  )
+}
+
+# The session directories under `remote` other than `current`.
+other_session <- function(remote, current) {
+  sessions <- list.files(remote, pattern = "^crew-ssh-[0-9a-f]+$")
+  setdiff(sessions, current)
+}
+
+# Start a held task named "slow" in another session, then end that session,
+# leaving its worker running. Returns that worker's process ID.
+dead_session_task <- function(remote, counter, release, data = list()) {
+  session <- session_in_background(
+    remote,
+    command = held_task(),
+    data = c(list(counter = counter, release = release), data),
+    name = "slow"
+  )
+  wait_until(file.exists(counter))
+  session$kill()
+  old <- other_session(remote, current = NULL)
+  tunnel <- readLines(file.path(remote, old, "tunnel.pid"))
+  wait_until(!pid_alive(tunnel), seconds = 30)
+  worker_pids(remote)[[1L]]
+}
+
+# The globals of a pipeline whose target `fit` calls slow_fit(), which calls
+# helper(), which reads scale_by. No function of `fit` reaches `other`.
+pipeline_globals <- function(helper = function(x) x * scale_by,
+                             scale_by = 2,
+                             other = function(x) x - 1,
+                             slow_fit = function(x) helper(sum(x))) {
+  list(
+    slow_fit = global_function(slow_fit),
+    helper = global_function(helper),
+    scale_by = scale_by,
+    other = global_function(other),
+    .Random.seed = sample.int(1000L, 3L)
+  )
+}
+
+# The process ID of the worker running a task under `remote`.
+fit_worker_pid <- function(remote) {
+  states <- task_states(remote)
+  worker <- names(states)[states == "running"]
+  path <- list.files(
+    remote, paste0("^", worker, "\\.pid$"),
+    recursive = TRUE, full.names = TRUE
+  )
+  readLines(path)
 }

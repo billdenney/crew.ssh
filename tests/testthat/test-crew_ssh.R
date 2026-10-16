@@ -145,7 +145,8 @@ test_that("worker_paths() keeps every record of a worker in the session director
       script = c("/tmp/crew-ssh-abc/worker-1.R", "/tmp/crew-ssh-abc/worker-2.R"),
       log = c("/tmp/crew-ssh-abc/worker-1.log", "/tmp/crew-ssh-abc/worker-2.log"),
       pid = c("/tmp/crew-ssh-abc/worker-1.pid", "/tmp/crew-ssh-abc/worker-2.pid"),
-      cid = c("/tmp/crew-ssh-abc/worker-1.cid", "/tmp/crew-ssh-abc/worker-2.cid")
+      cid = c("/tmp/crew-ssh-abc/worker-1.cid", "/tmp/crew-ssh-abc/worker-2.cid"),
+      task = c("/tmp/crew-ssh-abc/worker-1.task", "/tmp/crew-ssh-abc/worker-2.task")
     )
   )
 })
@@ -680,7 +681,7 @@ test_that("salvage_task() wraps a named task to run under salvage", {
   key <- salvage_key(
     command = quote(f(x)),
     data = list(x = 1),
-    globals_hash = salvage_globals_hash(list(f = plus_one_global)),
+    globals = salvage_globals_cache(list(f = plus_one_global)),
     seed = 1L,
     algorithm = NULL,
     packages = character(0L),
@@ -1113,11 +1114,11 @@ test_that("collect() and controller groups delete what they collect", {
   expect_identical(list.files(file.path(remote, "crew-ssh-salvage")), character(0L))
 })
 
-test_that("terminate() stops a worker in the middle of a task", {
+test_that("without salvage, terminate() stops a worker in the middle of a task", {
   skip_without_fake_ssh()
   remote <- remote_tempdir()
   started <- file.path(remote, "started")
-  controller <- fake_controller(remote)
+  controller <- fake_controller(remote, salvage = FALSE)
   on.exit(controller$terminate())
   controller$start()
   controller$push(
@@ -1139,6 +1140,54 @@ test_that("terminate() stops a worker in the middle of a task", {
   expect_true(pid_alive(pid))
   controller$terminate()
   wait_until(!pid_alive(pid), seconds = 10)
+})
+
+test_that("with salvage, terminate() leaves a busy worker to finish and save its task", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  controller <- fake_controller(remote, salvage = TRUE, workers = 2L)
+  on.exit(controller$terminate())
+  controller$start()
+  controller$push(
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow",
+    substitute = FALSE
+  )
+  controller$push(command = 6L * 7L, name = "quick")
+  wait_until(
+    {
+      controller$scale()
+      file.exists(counter) && controller$unresolved() < 2L
+    },
+    seconds = 60
+  )
+  wait_until(length(worker_pids(remote)) == 2L, seconds = 60)
+  pids <- worker_pids(remote)
+  states <- task_states(remote)
+  busy <- names(states)[states == "running"]
+  idle <- setdiff(names(pids), busy)
+  expect_length(busy, 1L)
+  expect_length(idle, 1L)
+  session <- other_session(remote, current = NULL)
+  expect_message(
+    controller$terminate(),
+    paste0("left ", busy, " (slow) running on fakehost to finish and save its task"),
+    fixed = TRUE
+  )
+  wait_until(!pid_alive(pids[[idle]]), seconds = 10)
+  expect_true(pid_alive(pids[[busy]]))
+  # Marked as gone, so later sessions count the worker left running.
+  expect_true(file.exists(file.path(remote, session, "ended")))
+  file.create(release)
+  wait_until(
+    length(list.files(file.path(remote, "crew-ssh-salvage"), "^slow-.*\\.rds$")) == 1L,
+    seconds = 60
+  )
+  wait_until(!pid_alive(pids[[busy]]), seconds = 60)
+  expect_identical(count_runs(counter), 1L)
 })
 
 test_that("a worker under a container runtime is found and stopped by its container ID", {
@@ -1192,11 +1241,6 @@ worker_pid <- function(remote, session) {
     full.names = TRUE
   )
   as.integer(readLines(files))
-}
-
-other_session <- function(remote, current) {
-  sessions <- list.files(remote, pattern = "^crew-ssh-[0-9a-f]+$")
-  setdiff(sessions, current)
 }
 
 test_that("a worker that loses its session finishes, saves, and hands over", {
@@ -1333,9 +1377,9 @@ test_that("a task left running by a dead session counts against workers", {
     },
     paste0(
       "1 task(s) are still running on workers of fakehost that this ",
-      "controller cannot reach (slow). Until they finish or this controller ",
-      "pushes them again, they count against its 1 worker(s), so it ",
-      "launches at most 0."
+      "controller cannot reach (slow). Until each finishes or a worker of ",
+      "this controller takes its task over, this controller launches at ",
+      "most 0 of its 1 worker(s)."
     ),
     fixed = TRUE
   )
@@ -1468,26 +1512,50 @@ test_that("remote_workers() counts a session started here as gone once its R pro
   expect_identical(private$dead_sessions(), "crew-ssh-ended")
 })
 
+test_that("a task pushed again behind other work waits while its old run counts", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  old_pid <- dead_session_task(remote, counter, release)
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  private <- controller$launcher$.__enclos_env__$private
+  private$.unreachable_seconds <- 0.5
+  controller$start()
+  controller$push(command = 6L * 7L, name = "other")
+  controller$push(
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow",
+    substitute = FALSE
+  )
+  # The worker launched next might take "other" while the old run goes on,
+  # so the old run holds the only slot until it ends and nothing launches.
+  controller$wait(mode = "all", seconds_timeout = 3)
+  expect_length(private$.handles, 0L)
+  expect_identical(private$unreachable_count(2L), 1L)
+  file.create(release)
+  controller$wait(mode = "all", seconds_timeout = 120)
+  results <- controller$collect()
+  expect_setequal(results$name, c("other", "slow"))
+  expect_identical(results$result[results$name == "slow"][[1L]], 42L)
+  expect_identical(count_runs(counter), 1L)
+  wait_until(!pid_alive(old_pid), seconds = 30)
+})
+
 test_that("a task pushed again holds the slot its old worker counted against", {
   skip_without_fake_ssh()
   skip_if_not_installed("callr")
   remote <- remote_tempdir()
   counter <- file.path(remote, "runs.txt")
   release <- file.path(remote, "release")
-  session <- session_in_background(
-    remote,
-    command = held_task(),
-    data = list(counter = counter, release = release),
-    name = "slow"
-  )
-  on.exit(session$kill())
-  wait_until(file.exists(counter))
-  session$kill()
-  old <- other_session(remote, current = NULL)
-  tunnel <- readLines(file.path(remote, old, "tunnel.pid"))
-  wait_until(!pid_alive(tunnel), seconds = 30)
-  controller <- fake_controller(remote, salvage = TRUE)
+  dead_session_task(remote, counter, release)
+  controller <- fake_controller(remote, salvage = TRUE, workers = 2L)
   on.exit(controller$terminate(), add = TRUE)
+  private <- controller$launcher$.__enclos_env__$private
+  private$.unreachable_seconds <- 0.5
   controller$start()
   controller$push(
     command = held_task(),
@@ -1495,8 +1563,9 @@ test_that("a task pushed again holds the slot its old worker counted against", {
     name = "slow",
     substitute = FALSE
   )
-  # The worker that takes the task is the slot, so with one worker it still
-  # launches, attaches, and waits instead of starting a second run.
+  # With a slot to spare, the worker launched takes the task, attaches, and
+  # waits instead of starting a second run. Once the records show it, that
+  # worker holds the slot and the old run no longer counts.
   wait_until(
     {
       controller$scale()
@@ -1504,14 +1573,224 @@ test_that("a task pushed again holds the slot its old worker counted against", {
     },
     seconds = 120
   )
-  expect_identical(
-    controller$launcher$.__enclos_env__$private$unreachable_unpushed(),
-    0L
+  wait_until(
+    {
+      controller$scale()
+      identical(private$unreachable_count(1L), 0L)
+    },
+    seconds = 30
   )
   file.create(release)
   controller$wait(mode = "all", seconds_timeout = 120)
   expect_identical(controller$pop()$result[[1L]], 42L)
   expect_identical(count_runs(counter), 1L)
+})
+
+test_that("a task pushed again with different inputs stops the old run in its place", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  old_pid <- dead_session_task(remote, counter, release, data = list(version = 1L))
+  old_key <- unname(read.dcf(
+    list.files(remote, "\\.task$", recursive = TRUE, full.names = TRUE)
+  )[1L, "task_key"])
+  lock <- file.path(remote, "crew-ssh-salvage", paste0(old_key, ".lock"))
+  expect_true(dir.exists(lock))
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  private <- controller$launcher$.__enclos_env__$private
+  private$.unreachable_seconds <- 0.5
+  controller$start()
+  expect_message(
+    {
+      controller$push(
+        command = held_task(),
+        data = list(counter = counter, release = release, version = 2L),
+        name = "slow",
+        substitute = FALSE
+      )
+      wait_until(
+        {
+          controller$scale()
+          !pid_alive(old_pid)
+        },
+        seconds = 60
+      )
+    },
+    paste0(
+      "of crew-ssh-[0-9a-z]+ \\(slow\\) on fakehost: each ran an earlier ",
+      "version of a task that this controller has pushed again"
+    )
+  )
+  expect_false(dir.exists(lock))
+  # The slot it held goes to the new version, which runs.
+  wait_until(
+    {
+      controller$scale()
+      count_runs(counter) == 2L
+    },
+    seconds = 120
+  )
+  file.create(release)
+  controller$wait(mode = "all", seconds_timeout = 120)
+  expect_identical(controller$pop()$result[[1L]], 42L)
+  expect_identical(count_runs(counter), 2L)
+})
+
+test_that("a run whose key was computed another way is never taken for a changed task", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  old_pid <- dead_session_task(remote, counter, release, data = list(version = 1L))
+  # As a crew.ssh from before keys recorded how they were computed wrote it.
+  task <- list.files(remote, "\\.task$", recursive = TRUE, full.names = TRUE)
+  record <- read.dcf(task)
+  write.dcf(record[, colnames(record) != "task_scheme", drop = FALSE], task)
+  controller <- fake_controller(remote, salvage = TRUE)
+  on.exit(controller$terminate(), add = TRUE)
+  private <- controller$launcher$.__enclos_env__$private
+  private$.unreachable_seconds <- 0.5
+  controller$start()
+  controller$push(
+    command = held_task(),
+    data = list(counter = counter, release = release, version = 2L),
+    name = "slow",
+    substitute = FALSE
+  )
+  controller$wait(mode = "all", seconds_timeout = 3)
+  expect_true(pid_alive(old_pid))
+  expect_identical(private$unreachable_count(1L), 1L)
+  expect_length(private$.handles, 0L)
+  file.create(release)
+  controller$wait(mode = "all", seconds_timeout = 120)
+  expect_identical(controller$pop()$result[[1L]], 42L)
+  expect_identical(count_runs(counter), 2L)
+})
+
+test_that("backlog_first() picks the unpushed tasks with a run going or a saved result", {
+  keys <- new.env(hash = TRUE, parent = emptyenv())
+  assign("e", "e-0", envir = keys)
+  expect_identical(
+    backlog_first(
+      names = c("a", "b", "c", "d", "e", "a b"),
+      running = c("b", "e", "zzz"),
+      saved = c("d-0123", "a_b-99"),
+      keys = keys
+    ),
+    c("b", "d", "a b")
+  )
+  expect_identical(
+    backlog_first(character(0L), "b", "d-0", keys),
+    character(0L)
+  )
+  expect_identical(
+    backlog_first(c("a", "b"), character(0L), character(0L), keys),
+    character(0L)
+  )
+})
+
+# A controller with an empty backlog, as start() makes it, without the tunnel
+# that start() opens.
+backlog_controller <- function(...) {
+  controller <- crew_controller_ssh(ssh_host = "fakehost", ...)
+  controller$.__enclos_env__$private$.queue_backlog <- collections::queue()
+  controller
+}
+
+backlog_names <- function(controller) {
+  queue <- controller$.__enclos_env__$private$.queue_backlog
+  as.character(unlist(queue$as_list()))
+}
+
+test_that("pop_backlog() sends tasks an earlier session left ahead of the rest, even when saturated", {
+  controller <- backlog_controller(workers = 1L)
+  launcher <- controller$launcher
+  private <- launcher$.__enclos_env__$private
+  private$.unreachable <- remote_unreachable_tasks(
+    remote_workers_frame(
+      paste(
+        worker_record("crew-ssh-dead", "FALSE", "worker-a", "TRUE", "running", "b-1", "b"),
+        collapse = "\n"
+      ),
+      "fakehost", "/remote", session = "crew-ssh-me"
+    ),
+    disconnected = character(0L)
+  )
+  private$.salvage_saved <- "d-0123"
+  private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
+  for (name in c("a", "b", "c", "d")) {
+    controller$push_backlog(name)
+  }
+  # One slot is free, which the backlog's first task takes as usual.
+  expect_identical(controller$pop_backlog(), c("b", "d", "a"))
+  expect_identical(backlog_names(controller), "c")
+  # Until the chosen tasks are pushed, targets is told there is room.
+  expect_true(launcher$salvage_passing())
+  expect_false(controller$saturated())
+  expect_identical(controller$pop_backlog(), "c")
+  expect_false(launcher$salvage_passing())
+  expect_identical(controller$pop_backlog(), character(0L))
+})
+
+test_that("an unreachable run gives its slot to its push only when nothing else waits", {
+  launcher <- crew_controller_ssh(ssh_host = "fakehost")$launcher
+  private <- launcher$.__enclos_env__$private
+  private$.unreachable <- remote_unreachable_tasks(
+    remote_workers_frame(
+      paste(
+        c(
+          worker_record("crew-ssh-dead", "FALSE", "worker-a", "TRUE", "running", "a-1", "a"),
+          worker_record("crew-ssh-dead", "FALSE", "worker-b", "TRUE", "running", "b-1", "b"),
+          worker_record("crew-ssh-dead", "FALSE", "worker-c", "TRUE", "running", "c-1", "c"),
+          # This session's worker has taken b over.
+          worker_record("crew-ssh-me", "TRUE", "worker-d", "TRUE", "waiting", "b-1", "b")
+        ),
+        collapse = "
+"
+      ),
+      "fakehost", "/remote", session = "crew-ssh-me"
+    ),
+    disconnected = character(0L)
+  )
+  private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
+  # a is pushed again under its key, c under a new one.
+  assign("a", "a-1", envir = private$.salvage_keys)
+  assign("c", "c-2", envir = private$.salvage_keys)
+  expect_identical(private$unreachable_repushed(), c(TRUE, FALSE, FALSE))
+  expect_true(private$unreachable_pending())
+  # Only a's push waits, so the next worker takes it: a gives up its slot.
+  expect_identical(private$unreachable_count(1L), 1L)
+  # Another task waits too and could take that worker: a keeps counting.
+  expect_identical(private$unreachable_count(2L), 2L)
+  expect_identical(private$unreachable_count(0L), 2L)
+  private$.unreachable <- remote_unreachable_none()
+  expect_identical(private$unreachable_count(3L), 0L)
+  expect_false(private$unreachable_pending())
+})
+
+test_that("pushing a chosen task clears its pass", {
+  launcher <- salvage_launcher()
+  private <- launcher$.__enclos_env__$private
+  private$.salvage_passes <- c("fit", "other")
+  push_fit(launcher)
+  expect_identical(private$.salvage_passes, "other")
+  expect_true(launcher$salvage_passing())
+})
+
+test_that("without salvage, the backlog keeps its order and nothing passes", {
+  controller <- backlog_controller(salvage = FALSE)
+  launcher <- controller$launcher
+  for (name in c("a", "b")) {
+    controller$push_backlog(name)
+  }
+  expect_identical(launcher$salvage_backlog(c("a", "b")), character(0L))
+  expect_false(launcher$salvage_passing())
+  expect_identical(controller$pop_backlog(), "a")
+  expect_identical(backlog_names(controller), "b")
 })
 
 test_that("a task whose worker was killed outright is run again once its lock goes quiet", {

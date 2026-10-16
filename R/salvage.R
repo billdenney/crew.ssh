@@ -19,13 +19,22 @@
 
 # Controller side ----
 
+# The version of the way keys are computed. Each worker records it with its
+# task, so a controller compares a key only with keys computed the same way:
+# a key of another version names the same task differently, and a task that
+# runs under one is never taken for a changed task (see the "Surviving a
+# disconnect" section of crew_controller_ssh()). Version 1, which crew.ssh did
+# not record, hashed every global of a targets pipeline into every key.
+salvage_scheme <- 2L
+
 # The key of a task: a readable prefix from the task name and a hash of
 # everything the task computes from. Two pushes get the same key exactly when
 # they would compute the same thing, so a saved result can stand in for a run.
+# `globals` is a salvage_globals_cache().
 salvage_key <- function(
   command,
   data,
-  globals_hash,
+  globals,
   seed,
   algorithm,
   packages,
@@ -37,7 +46,7 @@ salvage_key <- function(
     salvage_fingerprint_targets(
       data = data,
       name = name,
-      globals_hash = globals_hash,
+      globals = globals,
       visited = visited
     )
   } else {
@@ -46,7 +55,7 @@ salvage_key <- function(
       name = name,
       command = salvage_canonical(command, visited),
       data = salvage_canonical(data, visited),
-      globals = globals_hash,
+      globals = salvage_globals_hash(globals),
       seed = seed,
       algorithm = algorithm,
       packages = packages,
@@ -57,13 +66,81 @@ salvage_key <- function(
 }
 
 # targets ships the whole global environment of `_targets.R` with every task,
-# so the hash of the globals is computed once and reused while they stay the
-# same object. `.Random.seed` changes whenever the local session draws a
-# random number and does not change what a task computes: crew and targets
-# seed each task themselves.
-salvage_globals_hash <- function(globals) {
-  globals <- globals[setdiff(names(globals), ".Random.seed")]
-  rlang::hash(salvage_canonical(globals, salvage_visited()))
+# so hashes of the globals are computed once and kept here while the same
+# globals are pushed: the hash of all of them, and the hash and the global
+# dependencies of each one that a task needs.
+salvage_globals_cache <- function(globals) {
+  cache <- new.env(parent = emptyenv())
+  cache$globals <- globals
+  cache$all <- NULL
+  cache$hashes <- new.env(hash = TRUE, parent = emptyenv())
+  cache$deps <- new.env(hash = TRUE, parent = emptyenv())
+  cache
+}
+
+# `.Random.seed` changes whenever the local session draws a random number and
+# does not change what a task computes: crew and targets seed each task
+# themselves.
+salvage_globals_names <- function(cache) {
+  setdiff(names(cache$globals), ".Random.seed")
+}
+
+# The hash of every global, for a task that does not say which it uses.
+salvage_globals_hash <- function(cache) {
+  if (is.null(cache$all)) {
+    globals <- cache$globals[salvage_globals_names(cache)]
+    cache$all <- rlang::hash(salvage_canonical(globals, salvage_visited()))
+  }
+  cache$all
+}
+
+# The hashes of the globals a target depends on, named by global, as targets
+# finds them: those its command names, and those that the global functions
+# among them name in turn. targets reruns a target when one of these changes
+# and leaves it up to date when any other global changes, so the key changes
+# exactly then too.
+salvage_globals_target <- function(deps, cache) {
+  available <- salvage_globals_names(cache)
+  todo <- intersect(as.character(deps), available)
+  seen <- character(0L)
+  while (length(todo)) {
+    name <- todo[[1L]]
+    todo <- todo[-1L]
+    if (name %in% seen) {
+      next
+    }
+    seen <- c(seen, name)
+    more <- intersect(salvage_global_deps(name, cache), available)
+    todo <- c(todo, setdiff(more, seen))
+  }
+  seen <- sort(seen, method = "radix")
+  vapply(seen, salvage_global_hash, character(1L), cache = cache)
+}
+
+salvage_global_hash <- function(name, cache) {
+  hash <- get0(name, envir = cache$hashes, inherits = FALSE)
+  if (is.null(hash)) {
+    value <- cache$globals[[name]]
+    hash <- rlang::hash(salvage_canonical(value, salvage_visited()))
+    assign(name, hash, envir = cache$hashes)
+  }
+  hash
+}
+
+# The names a global function refers to, by targets' own reading of code, so
+# that a dependency counts here exactly when it counts for targets.
+salvage_global_deps <- function(name, cache) {
+  deps <- get0(name, envir = cache$deps, inherits = FALSE)
+  if (is.null(deps)) {
+    value <- cache$globals[[name]]
+    deps <- if (is.function(value)) {
+      targets::tar_deps_raw(value)
+    } else {
+      character(0L)
+    }
+    assign(name, deps, envir = cache$deps)
+  }
+  deps
 }
 
 salvage_is_targets <- function(command, data) {
@@ -77,9 +154,13 @@ salvage_is_targets <- function(command, data) {
 # upstream target reruns, even with an identical value (for example under
 # `tar_cue(mode = "always")`), so the target object is not hashed as a whole.
 # The fingerprint takes the fields that decide what the target computes:
-# its command, seed, storage settings, and the hashes of the data it depends
-# on.
-salvage_fingerprint_targets <- function(data, name, globals_hash, visited) {
+# its command, seed, storage settings, and the hashes of the data and of the
+# globals it depends on. The pipeline's options and environment variables,
+# which targets also ships, are left out, as targets leaves them out when it
+# decides whether a target is up to date: they set how the worker runs, such
+# as its memory and error handling, and every one that changes a value is
+# copied into the target's own settings when the target is defined.
+salvage_fingerprint_targets <- function(data, name, globals, visited) {
   target <- .subset2(data, "target")
   command <- .subset2(target, "command")
   settings <- .subset2(target, "settings")
@@ -94,6 +175,7 @@ salvage_fingerprint_targets <- function(data, name, globals_hash, visited) {
   )
   list(
     kind = "targets",
+    scheme = salvage_scheme,
     name = name,
     target = .subset2(settings, "name"),
     command = hash,
@@ -112,9 +194,7 @@ salvage_fingerprint_targets <- function(data, name, globals_hash, visited) {
     envir = salvage_canonical(.subset2(data, "envir"), visited),
     path_store = .subset2(data, "path_store"),
     fun = .subset2(data, "fun"),
-    options = salvage_canonical(.subset2(data, "options"), visited),
-    envvars = .subset2(data, "envvars"),
-    globals = globals_hash
+    globals = salvage_globals_target(.subset2(target, "deps"), globals)
   )
 }
 
@@ -385,7 +465,8 @@ salvage_shipped <- function(
       controller = controller,
       seconds_heartbeat = seconds[["heartbeat"]],
       seconds_stale = seconds[["stale"]],
-      seconds_poll = seconds[["poll"]]
+      seconds_poll = seconds[["poll"]],
+      scheme = salvage_scheme
     )
   )
 }
@@ -868,7 +949,8 @@ salvage_state <- function(
     task_key = key,
     task_name = name,
     task_state = state,
-    task_updated = sprintf("%.3f", as.numeric(Sys.time()))
+    task_updated = sprintf("%.3f", as.numeric(Sys.time())),
+    task_scheme = salvage$scheme
   )
   if (!is.null(started)) {
     fields$task_started <- sprintf("%.3f", as.numeric(started))

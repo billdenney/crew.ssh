@@ -55,6 +55,8 @@ Other plugin_ssh:
     \item \href{#method-crew_class_launcher_ssh-salvage_remove}{\code{crew_class_launcher_ssh$salvage_remove()}}
     \item \href{#method-crew_class_launcher_ssh-salvage_task}{\code{crew_class_launcher_ssh$salvage_task()}}
     \item \href{#method-crew_class_launcher_ssh-salvage_collect}{\code{crew_class_launcher_ssh$salvage_collect()}}
+    \item \href{#method-crew_class_launcher_ssh-salvage_backlog}{\code{crew_class_launcher_ssh$salvage_backlog()}}
+    \item \href{#method-crew_class_launcher_ssh-salvage_passing}{\code{crew_class_launcher_ssh$salvage_passing()}}
     \item \href{#method-crew_class_launcher_ssh-terminate}{\code{crew_class_launcher_ssh$terminate()}}
   }
 }
@@ -241,8 +243,10 @@ scaling.}
   \subsection{Details}{
     As in \code{crew}, except that with \code{salvage = TRUE}, tasks still
 running on workers this controller cannot reach count against
-\code{workers} until they finish or this controller pushes them again.
-See the "Surviving a disconnect" section of \code{\link[=crew_controller_ssh]{crew_controller_ssh()}}.
+\code{workers} until they finish or a worker of this controller takes them
+over, and those that run an earlier version of a task this controller
+has pushed are stopped. See the "Surviving a disconnect" section of
+\code{\link[=crew_controller_ssh]{crew_controller_ssh()}}.
   }
   \subsection{Returns}{
     \code{TRUE} if it launched workers, \code{FALSE} otherwise, invisibly.
@@ -502,21 +506,86 @@ resolved yet.
 }
 
 \if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-salvage_backlog"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-salvage_backlog}{}}}
+\subsection{\code{crew_class_launcher_ssh$salvage_backlog()}}{
+  Choose the tasks of a backlog that have something saved
+or running from an earlier session, so they are pushed first. The
+controller calls this from \code{pop_backlog()}; it is not meant to be
+called directly.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$salvage_backlog(names)}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Arguments}{
+    \if{html}{\out{<div class="arguments">}}
+    \describe{
+      \item{\code{names}}{Character vector, the names of the tasks in the backlog,
+in order.}
+    }
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    A task of this kind is cheap to push: a saved result comes back
+at once, a run of the same task is waited for instead of repeated, and
+a run of an earlier version of it is stopped as soon as the new version
+is pushed, which frees its slot. Until the task is pushed, none of that
+can happen, because only the push gives its key. The tasks chosen are
+pushed even when the controller is saturated (see \code{salvage_passing()}).
+The choice uses only what the controller last read from the remote
+system, so it costs no \code{ssh} call.
+  }
+  \subsection{Returns}{
+    Character vector, the names in \code{names} to push first, in their
+order there.
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-salvage_passing"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-salvage_passing}{}}}
+\subsection{\code{crew_class_launcher_ssh$salvage_passing()}}{
+  Whether a task chosen by \code{salvage_backlog()} is still to
+be pushed. The controller calls this from \code{saturated()}; it is not
+meant to be called directly.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$salvage_passing()}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    \code{targets} asks whether the controller is saturated before it
+pushes each task, and keeps the task back if it is. A chosen task is
+let through, and its push clears it.
+  }
+  \subsection{Returns}{
+    \code{TRUE} or \code{FALSE}.
+  }
+}
+
+\if{html}{\out{<hr>}}
 \if{html}{\out{<a id="method-crew_class_launcher_ssh-terminate"></a>}}
 \if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-terminate}{}}}
 \subsection{\code{crew_class_launcher_ssh$terminate()}}{
-  Terminate the launcher: stop remote workers, delete the
-saved results this session collected, and close the reverse \code{ssh}
-tunnel.
+  Terminate the launcher: stop the remote workers that are
+not busy, delete the saved results this session collected, and close
+the reverse \code{ssh} tunnel.
   \subsection{Usage}{
     \if{html}{\out{<div class="r">}}
     \preformatted{crew_class_launcher_ssh$terminate()}
     \if{html}{\out{</div>}}
   }
   \subsection{Details}{
-    Termination stops workers mid-task, including with
-\code{salvage = TRUE}: a disconnect lets a worker finish and save its task,
-but terminating the controller is a request to stop.
+    Without salvage, every worker is stopped. With
+\code{salvage = TRUE}, a worker in the middle of a task is left to finish
+it and save the result, as after a disconnect, and the rest are
+stopped. A pipeline stopped part way through, whether interrupted or
+halted by an error, therefore keeps its remote work: a later session
+reuses each saved result, waits for a task still running, and stops a
+run whose task has changed since (see the "Surviving a disconnect"
+section of \code{\link[=crew_controller_ssh]{crew_controller_ssh()}}). \code{terminate_orphans()}, called
+from a later session, stops the workers left running.
   }
   \subsection{Returns}{
     \code{NULL} (invisibly).

@@ -13,7 +13,7 @@ key_args <- function(...) {
   args <- list(
     command = quote(f(x)),
     data = list(x = 1),
-    globals_hash = salvage_globals_hash(list(f = plus_one)),
+    globals = salvage_globals_cache(list(f = plus_one)),
     seed = 1L,
     algorithm = "L'Ecuyer-CMRG",
     packages = "stats",
@@ -39,7 +39,7 @@ test_that("every input of a task changes its key", {
   changes <- list(
     command = quote(f(y)),
     data = list(x = 2),
-    globals_hash = salvage_globals_hash(list(f = plus_two)),
+    globals = salvage_globals_cache(list(f = plus_two)),
     seed = 2L,
     algorithm = "Mersenne-Twister",
     packages = c("stats", "utils"),
@@ -91,18 +91,22 @@ test_that("names that sanitize alike still get different keys", {
   )
 })
 
+globals_hash_of <- function(globals) {
+  salvage_globals_hash(salvage_globals_cache(globals))
+}
+
 test_that("the globals hash ignores .Random.seed and crew controllers", {
-  base <- salvage_globals_hash(list(f = plus_one))
+  base <- globals_hash_of(list(f = plus_one))
   expect_identical(
-    salvage_globals_hash(list(f = plus_one, .Random.seed = 1:3)),
+    globals_hash_of(list(f = plus_one, .Random.seed = 1:3)),
     base
   )
-  expect_false(identical(salvage_globals_hash(list(f = plus_two)), base))
+  expect_false(identical(globals_hash_of(list(f = plus_two)), base))
   first <- crew::crew_controller_local(name = "first")
   second <- crew::crew_controller_local(name = "second", workers = 3L)
   expect_identical(
-    salvage_globals_hash(list(f = plus_one, controller = first)),
-    salvage_globals_hash(list(f = plus_one, controller = second))
+    globals_hash_of(list(f = plus_one, controller = first)),
+    globals_hash_of(list(f = plus_one, controller = second))
   )
 })
 
@@ -411,7 +415,7 @@ targets_key <- function(data) {
   salvage_key(
     command = targets_command,
     data = data,
-    globals_hash = "g",
+    globals = salvage_globals_cache(list()),
     seed = NULL,
     algorithm = NULL,
     packages = character(0L),
@@ -443,12 +447,72 @@ test_that("a target without a command hash fails loudly", {
       salvage_fingerprint_targets(
         data = fake_targets_data(hash = hash),
         name = "fit",
-        globals_hash = "g",
+        globals = salvage_globals_cache(list()),
         visited = salvage_visited()
       ),
       class = "crew_error"
     )
   }
+})
+
+test_that("a target's key ignores the pipeline's options and environment variables", {
+  base <- targets_key(fake_targets_data())
+  data <- fake_targets_data()
+  data$options <- list(seed = 0L, memory = "transient", error = "continue")
+  data$envvars <- c(TAR_PROJECT = "other")
+  expect_identical(targets_key(data), base)
+})
+
+key_with_globals <- function(globals) {
+  salvage_key(
+    command = targets_command,
+    data = fake_targets_data(),
+    globals = salvage_globals_cache(globals),
+    seed = NULL,
+    algorithm = NULL,
+    packages = character(0L),
+    library = NULL,
+    name = "fit"
+  )
+}
+
+test_that("a target's key changes with the globals it uses and with no others", {
+  skip_if_not_installed("targets")
+  base <- key_with_globals(pipeline_globals())
+  expect_identical(key_with_globals(pipeline_globals()), base)
+  expect_identical(
+    key_with_globals(pipeline_globals(other = function(x) x - 2)),
+    base
+  )
+  used <- list(
+    slow_fit = pipeline_globals(slow_fit = function(x) helper(sum(x)) + 1),
+    helper = pipeline_globals(helper = function(x) x * scale_by * 1),
+    scale_by = pipeline_globals(scale_by = 3)
+  )
+  for (name in names(used)) {
+    expect_false(identical(key_with_globals(used[[name]]), base), info = name)
+  }
+})
+
+test_that("salvage_globals_target() walks each global function once, cycles included", {
+  skip_if_not_installed("targets")
+  cache <- salvage_globals_cache(
+    list(
+      a = global_function(function() b()),
+      b = global_function(function() a() + n),
+      n = 1,
+      unused = 2
+    )
+  )
+  hashes <- salvage_globals_target(c("a", "data"), cache)
+  expect_identical(names(hashes), c("a", "b", "n"))
+  expect_match(hashes, "^[0-9a-f]{32}$")
+  expect_identical(sort(ls(cache$deps)), c("a", "b", "n"))
+  expect_identical(salvage_globals_target(c("a", "data"), cache), hashes)
+  expect_identical(
+    salvage_globals_target(character(0L), cache),
+    stats::setNames(character(0L), character(0L))
+  )
 })
 
 # Worker side ----
@@ -514,7 +578,8 @@ test_that("salvage_shipped() ships functions without crew.ssh and the settings",
       controller = "test-controller",
       seconds_heartbeat = 1,
       seconds_stale = 3,
-      seconds_poll = 0.1
+      seconds_poll = 0.1,
+      scheme = 2L
     )
   )
 })
@@ -894,17 +959,20 @@ test_that("salvage_state() records a worker's task for remote_workers()", {
   expect_identical(
     colnames(state),
     c(
-      "task_key", "task_name", "task_state", "task_updated", "task_started",
-      "task_ended"
+      "task_key", "task_name", "task_state", "task_updated", "task_scheme",
+      "task_started", "task_ended"
     )
   )
   expect_identical(
-    unname(state[1L, c("task_key", "task_name", "task_state", "task_started", "task_ended")]),
-    c("k-1", "k", "success", "1790000000.250", "1790000060.500")
+    unname(state[1L, c("task_key", "task_name", "task_state", "task_scheme", "task_started", "task_ended")]),
+    c("k-1", "k", "success", "2", "1790000000.250", "1790000060.500")
   )
   shipped$state(shipped, "worker-a", "k-2", "k2", "waiting")
   state <- read.dcf(file.path(session, "worker-a.task"))
-  expect_identical(colnames(state), c("task_key", "task_name", "task_state", "task_updated"))
+  expect_identical(
+    colnames(state),
+    c("task_key", "task_name", "task_state", "task_updated", "task_scheme")
+  )
   expect_identical(unname(state[1L, "task_state"]), "waiting")
   expect_identical(
     list.files(session, pattern = "\\.tmp\\."),
@@ -1431,4 +1499,54 @@ test_that("a target whose code changed runs again instead of reusing", {
     character(0L)
   )
   expect_identical(list.files(file.path(remote, "crew-ssh-salvage"), "\\.rds$"), saved)
+})
+
+test_that("an edit to a function the target does not use leaves its run to be picked up", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  skip_if_not_installed("targets")
+  project <- remote_tempdir()
+  remote <- file.path(project, "remote")
+  dir.create(remote)
+  write_pipeline(project, remote, multiplier = 2, unrelated = 1)
+  interrupted_pipeline(project)
+  write_pipeline(project, remote, multiplier = 2, unrelated = 2)
+  second <- make_pipeline(project, background = TRUE)
+  on.exit(second$kill())
+  wait_until("waiting" %in% task_states(remote), seconds = 180)
+  expect_identical(count_runs(file.path(project, "fits.txt")), 1L)
+  file.create(file.path(project, "release"))
+  wait_until(!second$is_alive(), seconds = 180)
+  expect_identical(second$get_exit_status(), 0L)
+  store <- file.path(project, "_targets")
+  expect_identical(targets::tar_read(fit, store = store), 110)
+  expect_identical(count_runs(file.path(project, "fits.txt")), 1L)
+})
+
+test_that("an edit to the target's own function stops its run and runs the new version", {
+  skip_without_fake_ssh()
+  skip_if_not_installed("callr")
+  skip_if_not_installed("targets")
+  project <- remote_tempdir()
+  remote <- file.path(project, "remote")
+  dir.create(remote)
+  write_pipeline(project, remote, multiplier = 2)
+  interrupted_pipeline(project)
+  old <- fit_worker_pid(remote)
+  write_pipeline(project, remote, multiplier = 3)
+  second <- make_pipeline(project, background = TRUE)
+  on.exit(second$kill())
+  wait_until(!pid_alive(old), seconds = 180)
+  # The new version starts in the slot the old run held.
+  wait_until(count_runs(file.path(project, "fits.txt")) == 2L, seconds = 180)
+  expect_identical(
+    list.files(file.path(remote, "crew-ssh-salvage"), "\\.rds$"),
+    character(0L)
+  )
+  file.create(file.path(project, "release"))
+  wait_until(!second$is_alive(), seconds = 180)
+  expect_identical(second$get_exit_status(), 0L)
+  store <- file.path(project, "_targets")
+  expect_identical(targets::tar_read(fit, store = store), 165)
+  expect_identical(count_runs(file.path(project, "fits.txt")), 2L)
 })
