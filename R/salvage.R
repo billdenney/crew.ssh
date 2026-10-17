@@ -87,6 +87,7 @@ salvage_globals_cache <- function(globals) {
   cache$all <- NULL
   cache$hashes <- new.env(hash = TRUE, parent = emptyenv())
   cache$deps <- new.env(hash = TRUE, parent = emptyenv())
+  cache$enclosures <- new.env(hash = TRUE, parent = emptyenv())
   cache
 }
 
@@ -139,10 +140,18 @@ salvage_global_hash <- function(name, cache) {
   hash
 }
 
+# A global whose dependencies cannot be read depends on every global, which
+# can only rerun a task that a narrower key would have reused.
 salvage_global_deps <- function(name, cache) {
   deps <- get0(name, envir = cache$deps, inherits = FALSE)
   if (is.null(deps)) {
-    deps <- salvage_value_deps(cache$globals[[name]], salvage_visited())
+    deps <- tryCatch(
+      salvage_value_deps(cache$globals[[name]], salvage_visited(), cache),
+      error = identity
+    )
+    if (inherits(deps, "error")) {
+      deps <- salvage_globals_names(cache)
+    }
     assign(name, deps, envir = cache$deps)
   }
   deps
@@ -150,23 +159,35 @@ salvage_global_deps <- function(name, cache) {
 
 # The names a value refers to, some of which may be globals; the caller keeps
 # those. A function refers to what targets' reading of its code finds
-# (targets::tar_deps_raw()), to every string constant in its body, since
-# do.call("g", ...), match.fun("g") and get("g") reach a global by a string,
-# and to what the functions in its enclosing environment refer to. A list, an
-# environment (an R6 object or generator among them), an S4 object, and the
-# attributes of anything refer to what the functions inside them refer to,
-# which targets cannot see. A primitive, data, and the environments of R itself
-# and of packages refer to nothing here.
-salvage_value_deps <- function(x, visited) {
+# (targets::tar_deps_raw()), to every string constant in its body and default
+# arguments, since do.call("g", ...), match.fun("g") and get("g") reach a
+# global by a string, and to what the functions in its enclosing environment
+# refer to. A list, an environment (an R6 object or generator among them), an
+# S4 object, and the attributes of anything refer to what the functions inside
+# them refer to, which targets cannot see. A primitive, data, and the
+# environments of R itself and of packages refer to nothing here. With `cache`,
+# as for a global itself, the enclosing environment of a function is read once
+# for all the globals that share it (see salvage_enclosure_deps()).
+salvage_value_deps <- function(x, visited, cache = NULL) {
+  if (!salvage_needs_canonical(x)) {
+    return(character(0L))
+  }
   type <- typeof(x)
   if (identical(type, "closure")) {
     x <- utils::removeSource(x)
   }
   deps <- if (identical(type, "closure")) {
     c(
-      targets::tar_deps_raw(x),
+      # codetools warns about some uses of `...` it cannot place, which says
+      # nothing about the names the code refers to.
+      suppressWarnings(targets::tar_deps_raw(x)),
       salvage_code_strings(body(x)),
-      salvage_value_deps(environment(x), visited)
+      salvage_code_strings(formals(x)),
+      if (is.null(cache)) {
+        salvage_value_deps(environment(x), visited)
+      } else {
+        salvage_enclosure_deps(environment(x), cache)
+      }
     )
   } else if (identical(type, "environment")) {
     salvage_environment_deps(x, visited)
@@ -216,15 +237,53 @@ salvage_environment_deps <- function(x, visited) {
   )
 }
 
-# The string constants in code.
-salvage_code_strings <- function(code) {
-  text <- deparse(code, width.cutoff = 500L)
-  data <- utils::getParseData(parse(text = text, keep.source = TRUE))
-  strings <- data$text[data$token %in% "STR_CONST"]
-  if (!length(strings)) {
+# Functions sourced into one environment, or made by one factory, share their
+# enclosing environment, so what it refers to, everything reachable from it,
+# is read once for each set of globals pushed.
+salvage_enclosure_deps <- function(environment, cache) {
+  if (!is.null(salvage_environment_name(environment))) {
     return(character(0L))
   }
-  as.character(parse(text = strings, keep.source = FALSE))
+  address <- rlang::obj_address(environment)
+  deps <- get0(address, envir = cache$enclosures, inherits = FALSE)
+  if (is.null(deps)) {
+    deps <- salvage_environment_deps(environment, salvage_visited())
+    assign(address, deps, envir = cache$enclosures)
+  }
+  deps
+}
+
+# The string constants in code, a call, a pairlist such as a function's
+# formals, an expression, or a constant. The walk keeps its own stack, so code
+# nested deeper than R's evaluation depth is read too. An empty argument, as in
+# x[, 1] or a formal without a default, is passed only to typeof(), since
+# binding it to a variable would make reading the variable an error.
+salvage_code_strings <- function(code) {
+  if (is.character(code)) {
+    return(code)
+  }
+  walked <- c("language", "pairlist", "expression", "list")
+  if (!(typeof(code) %in% walked)) {
+    return(character(0L))
+  }
+  out <- character(0L)
+  stack <- list(code)
+  while (length(stack)) {
+    top <- stack[[length(stack)]]
+    stack[[length(stack)]] <- NULL
+    if (is.character(top)) {
+      out <- c(out, top)
+      next
+    }
+    # Pushed last to first, so the strings come out in the order of the code.
+    parts <- as.list(top)
+    for (index in rev(seq_along(parts))) {
+      if (typeof(parts[[index]]) %in% c("character", walked)) {
+        stack[[length(stack) + 1L]] <- parts[[index]]
+      }
+    }
+  }
+  unique(out)
 }
 
 salvage_is_targets <- function(command, data) {

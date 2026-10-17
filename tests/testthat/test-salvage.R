@@ -456,6 +456,12 @@ test_that("a target without a command hash fails loudly", {
 })
 
 test_that("keys are pinned, so a change to how they are computed is noticed", {
+  # rlang::hash() may change between rlang versions; this hash of plain data,
+  # recorded with rlang 1.3.0, tells whether these keys can be compared here.
+  skip_if(
+    !identical(rlang::hash(list(a = 1L, b = "x")), "ea7e68cd9df6cb7ead2c1ee934b2d195"),
+    "this rlang hashes differently from the one the keys were recorded with"
+  )
   # Changing how keys are computed changes every key. When these fail, raise
   # salvage_scheme too, so that runs keyed the old way are never taken for
   # changed tasks.
@@ -503,6 +509,42 @@ test_that("a target's key changes with the globals it uses and with no others", 
   for (name in names(used)) {
     expect_false(identical(key_with_globals(used[[name]]), base), info = name)
   }
+})
+
+test_that("a default argument that names a global by string is followed", {
+  skip_if_not_installed("targets")
+  cache <- salvage_globals_cache(
+    list(
+      f = global_function(function(fn = "g") do.call(fn, list(1))),
+      g = global_function(function(x) x)
+    )
+  )
+  expect_identical(names(salvage_globals_target("f", cache)), c("f", "g"))
+})
+
+test_that("functions that share an enclosing environment have it read once", {
+  skip_if_not_installed("targets")
+  shared <- new.env(parent = globalenv())
+  for (name in c("a", "b", "c")) {
+    assign(name, eval(quote(function(x) helper(x)), envir = shared), envir = shared)
+  }
+  globals <- c(as.list(shared), list(helper = global_function(function(x) x)))
+  cache <- salvage_globals_cache(globals)
+  for (name in c("a", "b", "c")) {
+    expect_identical(
+      names(salvage_globals_target(name, cache)),
+      sort(c(name, "helper"), method = "radix"),
+      info = name
+    )
+  }
+  expect_length(ls(cache$enclosures), 1L)
+})
+
+test_that("a global whose dependencies cannot be read depends on every global", {
+  skip_if_not_installed("targets")
+  local_mocked_bindings(salvage_value_deps = function(...) stop("unreadable"))
+  cache <- salvage_globals_cache(list(f = 1, g = 2, .Random.seed = 1:3))
+  expect_identical(salvage_global_deps("f", cache), c("f", "g"))
 })
 
 test_that("a global primitive is a dependency with nothing behind it", {
@@ -558,6 +600,27 @@ test_that("salvage_code_strings() finds the string constants in code", {
     c("g", "h's")
   )
   expect_identical(salvage_code_strings(quote(x)), character(0L))
+  expect_identical(salvage_code_strings("g"), "g")
+  expect_identical(salvage_code_strings(NULL), character(0L))
+  expect_identical(
+    salvage_code_strings(formals(function(a, fn = "g", b = list("h")) NULL)),
+    c("g", "h")
+  )
+})
+
+test_that("salvage_code_strings() reads code that deparsing cannot round-trip", {
+  long <- strrep("x", 2000L)
+  expect_identical(salvage_code_strings(call("paste", long, "g")), c(long, "g"))
+  # Constants that deparse to text R cannot parse back.
+  pointer <- methods::new("externalptr")
+  expect_identical(salvage_code_strings(call(".Call", pointer, "g")), "g")
+  expect_identical(salvage_code_strings(call("identity", new.env(), "g")), "g")
+  # Nested deeper than the parser or R's expression depth allows.
+  deep <- quote("g")
+  for (index in seq_len(6000L)) {
+    deep <- call("f", deep)
+  }
+  expect_identical(salvage_code_strings(deep), "g")
 })
 
 test_that("a target without readable dependencies fails loudly", {

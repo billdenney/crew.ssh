@@ -164,10 +164,11 @@ remote_salvage_script <- function(directory) {
 # it is running a task is left to finish it: with salvage it saves the result
 # once its connection is gone, as after a disconnect. Each one left running is
 # reported on a line beginning "crew-ssh-kept-worker:" while its process or
-# container runs. `ended`, when given, is a file to create after the stops,
-# which marks the session as gone for good, so that later sessions count the
-# workers left running as unreachable whatever its tunnel's remote end and its
-# R process are doing. A marker that cannot be written leaves the stops done.
+# container runs. `ended`, when given, is a file to create first, which marks
+# the session as gone for good, so that later sessions count the workers left
+# running as unreachable whatever its tunnel's remote end and its R process
+# are doing. Written first, it survives stops that run past the ssh timeout;
+# one that cannot be written does not keep the stops from running.
 remote_stop_script <- function(pids, sessions, cid_files, runtimes,
                                task_files = NULL, ended = NULL) {
   runtimes[is.na(runtimes)] <- ""
@@ -186,12 +187,14 @@ remote_stop_script <- function(pids, sessions, cid_files, runtimes,
     c(
       remote_stop_function(),
       if (is.null(task_files)) character(0L) else remote_stop_idle_function(),
-      calls,
+      # `true`, not the special builtin `:`, whose failed redirection would
+      # end a POSIX shell before the stops.
       if (is.null(ended)) {
         character(0L)
       } else {
-        paste0("{ : > ", shQuote(ended, type = "sh"), "; } 2>/dev/null || :")
+        paste0("{ true > ", shQuote(ended, type = "sh"), "; } 2>/dev/null || true")
       },
+      calls,
       "exit 0"
     ),
     collapse = "\n"
