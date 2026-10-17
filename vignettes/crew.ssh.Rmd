@@ -375,12 +375,15 @@ the next run does with that work depends on what you changed in between:
   only other targets call, or the controller's settings: the target matches,
   so the next run waits for the old run or reuses its result. A target is
   matched by the functions and objects of `_targets.R` it uses, directly or
-  through the functions it calls, found the way `targets` finds them, so the
-  rest of `_targets.R` can change freely.
+  through the functions it calls, including functions called by name (as in
+  `do.call("g", ...)`) or kept in lists and R6 objects, so the rest of
+  `_targets.R` can change freely.
 * **Something the target uses**, such as its command, a function it calls, or
   the data of an upstream target: the old run computes a result nothing will
   collect. When the next run pushes the target, it stops that run, says so,
-  and runs the new version in its place.
+  and runs the new version in its place. A run it never pushes, such as that
+  of a removed target or of a dynamic branch whose name changed with its
+  data, is left to finish and counts against `workers` until then.
 
 `launcher$terminate_orphans()`, from a later session, stops every worker left
 running without waiting for that.

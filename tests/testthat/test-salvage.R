@@ -455,6 +455,17 @@ test_that("a target without a command hash fails loudly", {
   }
 })
 
+test_that("keys are pinned, so a change to how they are computed is noticed", {
+  # Changing how keys are computed changes every key. When these fail, raise
+  # salvage_scheme too, so that runs keyed the old way are never taken for
+  # changed tasks.
+  expect_identical(key_of(), "fit-fb92758b4545e5bfc53c97703c4d4e01")
+  expect_identical(
+    targets_key(fake_targets_data()),
+    "fit-462676584223aaed2e605eb6b74ffa4b"
+  )
+})
+
 test_that("a target's key ignores the pipeline's options and environment variables", {
   base <- targets_key(fake_targets_data())
   data <- fake_targets_data()
@@ -491,6 +502,77 @@ test_that("a target's key changes with the globals it uses and with no others", 
   )
   for (name in names(used)) {
     expect_false(identical(key_with_globals(used[[name]]), base), info = name)
+  }
+})
+
+test_that("a global primitive is a dependency with nothing behind it", {
+  skip_if_not_installed("targets")
+  cache <- salvage_globals_cache(
+    list(
+      agg = sum,
+      `%+%` = `+`,
+      f = global_function(function(x) agg(x) %+% 1)
+    )
+  )
+  expect_identical(names(salvage_globals_target("f", cache)), c("%+%", "agg", "f"))
+})
+
+# The hashes of the globals a target calling f() depends on, with `helper`
+# among the globals.
+target_global_hashes <- function(f, helper) {
+  salvage_globals_target("f", salvage_globals_cache(list(f = f, helper = helper)))
+}
+
+test_that("a target's key follows globals that targets cannot see it use", {
+  skip_if_not_installed("targets")
+  helper_one <- global_function(function(x) x * 2)
+  helper_two <- global_function(function(x) x * 3)
+  hidden <- list(
+    # Called by name.
+    by_name = global_function(function(x) do.call("helper", list(x))),
+    # Kept in a list.
+    in_list = list(go = global_function(function(x) helper(x))),
+    # A method of an R6 class.
+    in_r6 = R6::R6Class(
+      "Hidden",
+      public = list(run = global_function(function(x) helper(x)))
+    )
+  )
+  for (name in names(hidden)) {
+    one <- target_global_hashes(hidden[[name]], helper_one)
+    expect_identical(names(one), c("f", "helper"), info = name)
+    expect_false(
+      identical(one, target_global_hashes(hidden[[name]], helper_two)),
+      info = name
+    )
+  }
+})
+
+test_that("salvage_code_strings() finds the string constants in code", {
+  expect_identical(
+    salvage_code_strings(quote({
+      do.call("g", list(x[, 1]))
+      get("h's")
+      paste0(1, 2)
+    })),
+    c("g", "h's")
+  )
+  expect_identical(salvage_code_strings(quote(x)), character(0L))
+})
+
+test_that("a target without readable dependencies fails loudly", {
+  for (deps in list(NULL, NA_character_, 1L)) {
+    data <- fake_targets_data()
+    data$target$deps <- deps
+    expect_error(
+      salvage_fingerprint_targets(
+        data = data,
+        name = "fit",
+        globals = salvage_globals_cache(list()),
+        visited = salvage_visited()
+      ),
+      class = "crew_error"
+    )
   }
 })
 
@@ -579,7 +661,9 @@ test_that("salvage_shipped() ships functions without crew.ssh and the settings",
       seconds_heartbeat = 1,
       seconds_stale = 3,
       seconds_poll = 0.1,
-      scheme = 2L
+      scheme = 2L,
+      hasher = salvage_hasher(),
+      scope = salvage_scope()
     )
   )
 })
@@ -960,18 +1044,23 @@ test_that("salvage_state() records a worker's task for remote_workers()", {
     colnames(state),
     c(
       "task_key", "task_name", "task_state", "task_updated", "task_scheme",
-      "task_started", "task_ended"
+      "task_hasher", "task_scope", "task_started", "task_ended"
     )
   )
   expect_identical(
     unname(state[1L, c("task_key", "task_name", "task_state", "task_scheme", "task_started", "task_ended")]),
     c("k-1", "k", "success", "2", "1790000000.250", "1790000060.500")
   )
+  expect_identical(unname(state[1L, "task_hasher"]), salvage_hasher())
+  expect_identical(unname(state[1L, "task_scope"]), salvage_scope())
   shipped$state(shipped, "worker-a", "k-2", "k2", "waiting")
   state <- read.dcf(file.path(session, "worker-a.task"))
   expect_identical(
     colnames(state),
-    c("task_key", "task_name", "task_state", "task_updated", "task_scheme")
+    c(
+      "task_key", "task_name", "task_state", "task_updated", "task_scheme",
+      "task_hasher", "task_scope"
+    )
   )
   expect_identical(unname(state[1L, "task_state"]), "waiting")
   expect_identical(

@@ -527,14 +527,16 @@ in order.}
     \if{html}{\out{</div>}}
   }
   \subsection{Details}{
-    A task of this kind is cheap to push: a saved result comes back
-at once, a run of the same task is waited for instead of repeated, and
-a run of an earlier version of it is stopped as soon as the new version
-is pushed, which frees its slot. Until the task is pushed, none of that
+    For a task of this kind a saved result comes back at once, a
+run of the same task is waited for instead of repeated, and a run of
+an earlier version of it is stopped as soon as the new version is
+pushed, which frees its slot. Until the task is pushed, none of that
 can happen, because only the push gives its key. The tasks chosen are
-pushed even when the controller is saturated (see \code{salvage_passing()}).
-The choice uses only what the controller last read from the remote
-system, so it costs no \code{ssh} call.
+pushed even when the controller is saturated (see \code{salvage_passing()}),
+but each such push holds its task's data in memory until a worker
+takes it, so at most \code{workers} of them wait at a time. The choice uses
+only what the controller last read from the remote system, so it costs
+no \code{ssh} call, and nothing at all when no run or saved result is left.
   }
   \subsection{Returns}{
     Character vector, the names in \code{names} to push first, in their

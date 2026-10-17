@@ -1671,26 +1671,40 @@ test_that("a run whose key was computed another way is never taken for a changed
   expect_identical(count_runs(counter), 2L)
 })
 
+# A saved key as salvage_key() makes it for a task called `name`.
+saved_key <- function(name, digit = "0") {
+  paste0(salvage_prefix(name), "-", strrep(digit, 32L))
+}
+
 test_that("backlog_first() picks the unpushed tasks with a run going or a saved result", {
   keys <- new.env(hash = TRUE, parent = emptyenv())
   assign("e", "e-0", envir = keys)
   expect_identical(
     backlog_first(
-      names = c("a", "b", "c", "d", "e", "a b"),
+      names = c("a", "b", "c", "d", "e", "a b", "d-2"),
       running = c("b", "e", "zzz"),
-      saved = c("d-0123", "a_b-99"),
+      saved = c(saved_key("d"), saved_key("a b"), "d-2-old"),
       keys = keys
     ),
     c("b", "d", "a b")
   )
+  # A saved key matches by its whole prefix, not by a shared start.
   expect_identical(
-    backlog_first(character(0L), "b", "d-0", keys),
+    backlog_first("fit", character(0L), saved_key("fit_2"), keys),
+    character(0L)
+  )
+  expect_identical(
+    backlog_first(character(0L), "b", saved_key("d"), keys),
     character(0L)
   )
   expect_identical(
     backlog_first(c("a", "b"), character(0L), character(0L), keys),
     character(0L)
   )
+  expect_identical(salvage_has_state(character(0L), "b", saved_key("d")), logical(0L))
+  expect_identical(pushed_names(NULL), character(0L))
+  expect_identical(pushed_names(keys), "e")
+  expect_identical(pushed_keys(c("e", "f"), keys), c("e-0", NA))
 })
 
 # A controller with an empty backlog but no tunnel. crew's terminate() gives
@@ -1720,20 +1734,42 @@ test_that("pop_backlog() sends tasks an earlier session left ahead of the rest, 
     ),
     disconnected = character(0L)
   )
-  private$.salvage_saved <- "d-0123"
+  private$.salvage_saved <- saved_key("d")
   private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
   for (name in c("a", "b", "c", "d")) {
     controller$push_backlog(name)
   }
-  # One slot is free, which the backlog's first task takes as usual.
-  expect_identical(controller$pop_backlog(), c("b", "d", "a"))
-  expect_identical(backlog_names(controller), "c")
-  # Until the chosen tasks are pushed, targets is told there is room.
+  # b goes first, past saturation, and at most `workers` such tasks wait at a
+  # time; the one free slot goes to the backlog's first task as usual.
+  expect_identical(controller$pop_backlog(), c("b", "a"))
+  expect_identical(backlog_names(controller), c("c", "d"))
+  # Until the chosen task is pushed, targets is told there is room.
   expect_true(launcher$salvage_passing())
   expect_false(controller$saturated())
+  # Once b is pushed, it fills the one place, so d waits its turn.
+  assign("b", "b-1", envir = private$.salvage_keys)
   expect_identical(controller$pop_backlog(), "c")
   expect_false(launcher$salvage_passing())
-  expect_identical(controller$pop_backlog(), character(0L))
+  expect_identical(backlog_names(controller), "d")
+})
+
+test_that("at most `workers` chosen tasks are pushed past saturation at a time", {
+  controller <- backlog_controller(workers = 2L)
+  launcher <- controller$launcher
+  private <- launcher$.__enclos_env__$private
+  private$.unreachable <- remote_unreachable_none()
+  private$.salvage_saved <- vapply(c("a", "b", "c", "d"), saved_key, character(1L))
+  private$.salvage_keys <- new.env(hash = TRUE, parent = emptyenv())
+  expect_identical(launcher$salvage_backlog(c("a", "b", "c", "x")), c("a", "b"))
+  # One chosen task is pushed and not yet collected: one more may go.
+  assign("a", saved_key("a"), envir = private$.salvage_keys)
+  expect_identical(launcher$salvage_backlog(c("b", "c", "x")), "b")
+  assign("b", saved_key("b"), envir = private$.salvage_keys)
+  expect_identical(launcher$salvage_backlog(c("c", "x")), character(0L))
+  expect_false(launcher$salvage_passing())
+  # With nothing saved and nothing running, nothing is chosen.
+  private$.salvage_saved <- character(0L)
+  expect_identical(launcher$salvage_backlog(c("c", "x")), character(0L))
 })
 
 test_that("an unreachable run gives its slot to its push only when nothing else waits", {
@@ -1770,6 +1806,30 @@ test_that("an unreachable run gives its slot to its push only when nothing else 
   private$.unreachable <- remote_unreachable_none()
   expect_identical(private$unreachable_count(3L), 0L)
   expect_false(private$unreachable_pending())
+})
+
+test_that("obsolete_runs() stops only a changed task of this project, keyed the same way", {
+  shipped <- list(hasher = "R 4.6.1, rlang 1.1.6", scope = "here")
+  runs <- data.frame(
+    task_key = c("a-1", "b-1", "c-1", "d-1", "e-1", "f-1", "g-1"),
+    task_name = c("a", "b", "c", "d", "e", "f", "g"),
+    task_scheme = c(2L, 2L, NA, 1L, 2L, 2L, 2L),
+    task_hasher = c(rep(shipped$hasher, 5L), "R 4.5.0, rlang 1.1.6", shipped$hasher),
+    task_scope = c("here", "here", "here", "here", "there", "here", NA),
+    stringsAsFactors = FALSE
+  )
+  # a changed; b is the same task; c-f differ in how or where they were keyed;
+  # g has no project recorded.
+  pushed <- c("a-2", "b-1", "c-2", "d-2", "e-2", "f-2", "g-2")
+  expect_identical(
+    obsolete_runs(runs, pushed, shipped),
+    c(TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE)
+  )
+  # A task this session has not pushed is never obsolete.
+  expect_identical(
+    obsolete_runs(runs[1L, ], NA_character_, shipped),
+    FALSE
+  )
 })
 
 test_that("pushing a chosen task clears its pass", {

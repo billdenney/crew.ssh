@@ -598,14 +598,16 @@ crew_class_launcher_ssh <- R6::R6Class(
     #'   or running from an earlier session, so they are pushed first. The
     #'   controller calls this from `pop_backlog()`; it is not meant to be
     #'   called directly.
-    #' @details A task of this kind is cheap to push: a saved result comes back
-    #'   at once, a run of the same task is waited for instead of repeated, and
-    #'   a run of an earlier version of it is stopped as soon as the new version
-    #'   is pushed, which frees its slot. Until the task is pushed, none of that
+    #' @details For a task of this kind a saved result comes back at once, a
+    #'   run of the same task is waited for instead of repeated, and a run of
+    #'   an earlier version of it is stopped as soon as the new version is
+    #'   pushed, which frees its slot. Until the task is pushed, none of that
     #'   can happen, because only the push gives its key. The tasks chosen are
-    #'   pushed even when the controller is saturated (see `salvage_passing()`).
-    #'   The choice uses only what the controller last read from the remote
-    #'   system, so it costs no `ssh` call.
+    #'   pushed even when the controller is saturated (see `salvage_passing()`),
+    #'   but each such push holds its task's data in memory until a worker
+    #'   takes it, so at most `workers` of them wait at a time. The choice uses
+    #'   only what the controller last read from the remote system, so it costs
+    #'   no `ssh` call, and nothing at all when no run or saved result is left.
     #' @return Character vector, the names in `names` to push first, in their
     #'   order there.
     #' @param names Character vector, the names of the tasks in the backlog,
@@ -615,12 +617,18 @@ crew_class_launcher_ssh <- R6::R6Class(
       if (!isTRUE(private$.salvage) || !length(names)) {
         return(character(0L))
       }
-      first <- backlog_first(
-        names = names,
-        running = private$.unreachable$task_name,
-        saved = private$.salvage_saved,
-        keys = private$.salvage_keys
-      )
+      running <- private$.unreachable$task_name
+      saved <- private$.salvage_saved
+      if (!length(running) && !length(saved)) {
+        return(character(0L))
+      }
+      keys <- private$.salvage_keys
+      first <- backlog_first(names, running, saved, keys)
+      # Each task pushed past saturation holds its data in memory until a
+      # worker takes it, so at most `workers` of them wait at a time.
+      pushed <- pushed_names(keys)
+      waiting <- sum(salvage_has_state(pushed, running, saved))
+      first <- utils::head(first, max(0L, private$.workers - waiting))
       private$.salvage_passes <- first
       first
     },
@@ -1224,7 +1232,10 @@ crew_class_launcher_ssh <- R6::R6Class(
     # to finish is such a push: the next worker crew launches then takes one
     # of them and waits instead of starting other work. While other tasks
     # wait too, mirai may give that worker one of those, and the old run goes
-    # on all the same, so it counts until its own push is taken.
+    # on all the same, so it counts until its own push is taken. The test
+    # compares counts, so a pushed task that has finished but not been
+    # collected can pass it for a moment; the cost is a waiting worker, which
+    # computes nothing.
     unreachable_count = function(tasks) {
       runs <- private$.unreachable
       if (is.null(runs) || !nrow(runs)) {
@@ -1240,13 +1251,7 @@ crew_class_launcher_ssh <- R6::R6Class(
     # Which unreachable runs this session has pushed again under the same key.
     unreachable_repushed = function() {
       runs <- private$.unreachable
-      pushed <- vapply(
-        runs$task_name,
-        pushed_key,
-        character(1L),
-        keys = private$.salvage_keys,
-        USE.NAMES = FALSE
-      )
+      pushed <- pushed_keys(runs$task_name, private$.salvage_keys)
       !is.na(pushed) & pushed == runs$task_key
     },
     # Whether this session has pushed a task again, under the same key, that
@@ -1260,27 +1265,23 @@ crew_class_launcher_ssh <- R6::R6Class(
       any(!runs$claimed & private$unreachable_repushed())
     },
     # Stop the unreachable workers that run an earlier version of a task this
-    # controller has pushed: the same name under a different key computed the
-    # same way. A worker of another session is unreachable only once that
-    # session is gone, so this never stops the work of a live session. A task
-    # whose key was computed another way is left to finish, since its key
-    # says nothing about whether the task changed. A stop that fails is tried
-    # again after .unreachable_seconds.
+    # controller has pushed: the same name, from the same project, under a
+    # different key computed the same way (the same scheme, R and rlang). A
+    # worker of another session is unreachable only once that session is
+    # gone, so this never stops the work of a live session. A run from another
+    # project, or whose key was computed another way, is left to finish, since
+    # its key says nothing about whether this task changed. A stop that fails
+    # is tried again after .unreachable_seconds.
     unreachable_obsolete = function() {
       tasks <- private$.unreachable
       if (!nrow(tasks)) {
         return(invisible())
       }
-      pushed <- vapply(
-        tasks$task_name,
-        pushed_key,
-        character(1L),
-        keys = private$.salvage_keys,
-        USE.NAMES = FALSE
+      obsolete <- obsolete_runs(
+        runs = tasks,
+        pushed = pushed_keys(tasks$task_name, private$.salvage_keys),
+        shipped = private$.salvage_shipped
       )
-      obsolete <- !is.na(pushed) &
-        pushed != tasks$task_key &
-        tasks$task_scheme %in% salvage_scheme
       due <- as.numeric(Sys.time()) - private$.obsolete_tried >=
         private$.unreachable_seconds
       if (!any(obsolete) || !due) {
@@ -1695,9 +1696,14 @@ crew_class_controller_ssh <- R6::R6Class(
 #'      a worker runs, but with a different key, the task has changed since
 #'      that run began: its command, the data it depends on, or a global it
 #'      uses. Nothing will collect the old run's result, so the controller
-#'      stops that worker, says so, and frees its slot. A run whose key was
-#'      computed by a crew.ssh from before keys recorded how they were
-#'      computed is left to finish.
+#'      stops that worker, says so, and frees its slot. It does so only for a
+#'      run pushed from the same project (the same local working directory)
+#'      whose key was computed the same way, by the same version of crew.ssh's
+#'      key scheme, R, and `rlang`. Any other run is left to finish: its key
+#'      says nothing about whether this task changed. Neither is a run
+#'      stopped whose task this controller never pushes, such as a removed
+#'      target, or a branch of a dynamic target whose name changed with its
+#'      data; it counts against `workers` until it finishes.
 #'   7. Tasks an earlier session has saved or still runs go first. When
 #'      `targets` holds tasks back because the controller is saturated, the
 #'      controller pushes those ahead of the rest, even while saturated, so a
@@ -1733,14 +1739,21 @@ crew_class_controller_ssh <- R6::R6Class(
 #'   A task is identified by its name and by everything it computes from: the
 #'   command, data, globals, seed, and packages, or for a `targets` target,
 #'   its command, seed, settings, the hashes of the data it depends on, and
-#'   the globals it uses, directly or through the global functions it calls,
-#'   found the way `targets` finds them. A change to any other global, such as
-#'   an unrelated function in `_targets.R`, leaves the key as it was, just as
-#'   it leaves the target up to date for `targets`; so does a change to the
-#'   pipeline's options, such as its controller. A task pushed without a name,
-#'   as `push()` allows, runs without salvage. Salvage assumes a task gives
-#'   the same result each time it runs with the same inputs, which `targets`
-#'   arranges by seeding every target.
+#'   the globals it uses: those its command names, and in turn those that
+#'   each of them refers to. A function refers to the globals `targets` finds
+#'   in its code, to any whose name appears in it as a string, as in
+#'   `do.call("g", ...)`, and to those the functions in its enclosing
+#'   environment refer to; a list, an environment (an R6 object or generator
+#'   among them), or an S4 object refers to those its functions refer to.
+#'   That covers every global `targets` reruns a target for, and some it
+#'   cannot see. A change to any other global, such as an unrelated function
+#'   in `_targets.R`, leaves the key as it was; so does a change to the
+#'   pipeline's options, such as its controller. With `tar_option_set(envir =
+#'   )` set to an environment other than the global one, `targets` ships that
+#'   whole environment, and any change to it changes every key. A task pushed
+#'   without a name, as `push()` allows, runs without salvage. Salvage assumes
+#'   a task gives the same result each time it runs with the same inputs,
+#'   which `targets` arranges by seeding every target.
 #'
 #'   A saved result is deleted once a controller collects it with `pop()`,
 #'   `collect()`, or `map()`. Results nothing collects stay until the
@@ -1924,34 +1937,48 @@ reconnect_pause <- function(tries, remaining, first, longest, jitter) {
 
 # The names in a backlog, `names`, that this session has not pushed (`keys`,
 # as in pushed_key()) and that have a run going on a worker of an earlier
-# session (`running`, task names) or a saved result (`saved`, keys). A saved
-# result counts by the prefix of its key, so it may be from an earlier version
-# of the task, which then runs again; pushing it first costs nothing either
-# way.
+# session or a saved result (see salvage_has_state()).
 backlog_first <- function(names, running, saved, keys) {
-  prefixes <- paste0(
-    vapply(names, salvage_prefix, character(1L), USE.NAMES = FALSE),
-    "-"
-  )
-  has_saved <- vapply(
-    prefixes,
-    prefix_found,
-    logical(1L),
-    keys = saved,
-    USE.NAMES = FALSE
-  )
-  pushed <- !is.na(vapply(
-    names,
-    pushed_key,
-    character(1L),
-    keys = keys,
-    USE.NAMES = FALSE
-  ))
-  names[(names %in% running | has_saved) & !pushed]
+  if (!length(names) || (!length(running) && !length(saved))) {
+    return(character(0L))
+  }
+  first <- salvage_has_state(names, running, saved) &
+    !(names %in% pushed_names(keys))
+  names[first]
 }
 
-prefix_found <- function(prefix, keys) {
-  any(startsWith(keys, prefix))
+# Whether each task called `names` has a run going on a worker of an earlier
+# session (`running`, task names) or a saved result (`saved`, keys). A saved
+# result counts by its key's prefix, which is salvage_prefix() of the name, so
+# it may be from an earlier version of the task, or from a task whose name
+# sanitizes alike; such a task then runs again as usual.
+salvage_has_state <- function(names, running, saved) {
+  names %in% running | salvage_prefix(names) %in% salvage_key_prefix(saved)
+}
+
+# Which unreachable runs (`runs`, a remote_unreachable_tasks() frame) run an
+# earlier version of a task this session pushed: the same name under another
+# key (`pushed`, as pushed_keys() gives them for runs$task_name), computed the
+# same way and in the same project as this session's keys (`shipped`, the
+# settings salvage_shipped() gives the workers).
+obsolete_runs <- function(runs, pushed, shipped) {
+  !is.na(pushed) &
+    pushed != runs$task_key &
+    runs$task_scheme %in% salvage_scheme &
+    runs$task_hasher %in% shipped$hasher &
+    runs$task_scope %in% shipped$scope
+}
+
+# The names of the tasks this session has pushed and not collected, from the
+# keys salvage_task() records.
+pushed_names <- function(keys) {
+  if (is.null(keys)) character(0L) else ls(keys, all.names = TRUE)
+}
+
+# The salvage keys under which this session pushed the tasks called `names`,
+# NA for each it has not pushed or has collected.
+pushed_keys <- function(names, keys) {
+  vapply(names, pushed_key, character(1L), keys = keys, USE.NAMES = FALSE)
 }
 
 # The salvage key under which this session pushed the task called `name` and

@@ -53,6 +53,7 @@ test_that("remote_workers_frame() types every column, even with no workers", {
       local_created = "numeric",
       task_key = "character", task_name = "character",
       task_state = "character", task_scheme = "integer",
+      task_hasher = "character", task_scope = "character",
       task_started = "POSIXct", task_ended = "POSIXct",
       task_updated = "POSIXct"
     )
@@ -475,6 +476,8 @@ test_that("remote_unreachable_tasks() finds the running tasks no connection reac
       task_key = c("fit-1", "old-5", "v1-8"),
       task_name = c("fit", "old", "v1"),
       task_scheme = c(2L, 2L, NA),
+      task_hasher = NA_character_,
+      task_scope = NA_character_,
       session = c("crew-ssh-dead", "crew-ssh-me", "crew-ssh-dead"),
       session_directory = c(
         "/remote/crew-ssh-dead", "/remote/crew-ssh-me", "/remote/crew-ssh-dead"
@@ -500,8 +503,8 @@ test_that("remote_unreachable_tasks() finds the running tasks no connection reac
   expect_identical(
     names(remote_unreachable_none()),
     c(
-      "task_key", "task_name", "task_scheme", "session", "session_directory",
-      "worker", "pid", "runtime", "claimed"
+      "task_key", "task_name", "task_scheme", "task_hasher", "task_scope",
+      "session", "session_directory", "worker", "pid", "runtime", "claimed"
     )
   )
 })
@@ -755,6 +758,13 @@ test_that("remote_stop_waiters_script() treats sessions known to have ended as g
   expect_true(live_waiter$is_alive())
 })
 
+workers_under <- function(remote) {
+  remote_workers_frame(
+    run_sh(remote_workers_script(remote)),
+    "host", remote, session = NULL
+  )
+}
+
 test_that("a session that left an ended marker counts as gone", {
   skip_without_sh()
   remote <- remote_tempdir()
@@ -766,13 +776,38 @@ test_that("a session that left an ended marker counts as gone", {
   })
   directory <- write_session_records(remote, "crew-ssh-left", tunnel$get_pid())
   write_worker_records(directory, "worker-a", worker$get_pid(), "running", "fit")
-  frame <- function() {
-    remote_workers_frame(
-      run_sh(remote_workers_script(remote)),
-      "host", remote, session = NULL
-    )
-  }
-  expect_true(frame()$session_alive)
+  expect_true(workers_under(remote)$session_alive)
   file.create(file.path(directory, "ended"))
-  expect_false(frame()$session_alive)
+  expect_false(workers_under(remote)$session_alive)
+})
+
+test_that("remote_stop_waiters_script() stops the waiters of a session that left an ended marker", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  # Its tunnel's remote end is still up, so only the marker says it is gone.
+  tunnel <- process_naming("crew-ssh-left")
+  waiter <- process_naming("crew-ssh-left")
+  on.exit({
+    tunnel$kill()
+    waiter$kill()
+  })
+  directory <- write_session_records(remote, "crew-ssh-left", tunnel$get_pid())
+  write_worker_records(directory, "worker-w", waiter$get_pid(), "waiting", "fit")
+  file.create(file.path(directory, "ended"))
+  out <- run_sh(
+    paste(
+      remote_stop_waiters_script(remote, session = "crew-ssh-new"),
+      "exit 0",
+      sep = "\n"
+    )
+  )
+  expect_identical(
+    strsplit(out, "\n", fixed = TRUE)[[1L]],
+    c(
+      "crew-ssh-closed-tunnel: crew-ssh-left",
+      "crew-ssh-stopped-waiter: crew-ssh-left worker-w fit"
+    )
+  )
+  wait_until(!waiter$is_alive(), seconds = 10)
+  wait_until(!tunnel$is_alive(), seconds = 10)
 })
