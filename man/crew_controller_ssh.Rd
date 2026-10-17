@@ -351,10 +351,38 @@ a session that is gone or one of this session from before its tunnel
 was reopened, takes up the remote system as much as a connected
 worker does, so it counts against \code{workers} until it finishes: the
 controller launches only as many workers as are left, and says so.
-Once the same task is pushed again, the worker that takes it holds
-the slot instead, while it hands back the saved result or waits for
-the running one. The controller reads the remote records for this at
-most every 30 seconds.
+Once a worker of this controller takes the same task over, waiting
+for the running one or handing back its saved result, that worker
+holds the slot instead. When pushes of such tasks are all the work
+this controller has waiting, the slot goes to them at once, since the
+next worker launched can only take one of them; while other tasks
+wait too, that worker might take one of those, so the old run counts
+until its own push is taken. The controller reads the remote records
+for this at most every 30 seconds.
+\item When the controller pushes a task under the name of a task that such
+a worker runs, but with a different key, the task has changed since
+that run began: its command, the data it depends on, or a global it
+uses. Nothing will collect the old run's result, so the controller
+stops that worker, says so, and frees its slot. It does so only for a
+run pushed from the same project (the same local working directory)
+whose key was computed the same way, by the same version of crew.ssh's
+key scheme, R, and \code{rlang}. Any other run is left to finish: its key
+says nothing about whether this task changed. Neither is a run
+stopped whose task this controller never pushes, such as a removed
+target, or a branch of a dynamic target whose name changed with its
+data; it counts against \code{workers} until it finishes.
+\item Tasks an earlier session has saved or still runs go first. When
+\code{targets} holds tasks back because the controller is saturated, the
+controller pushes those ahead of the rest, even while saturated, so a
+saved result comes back, a run in progress is waited for, and a
+changed one is stopped without waiting for a free slot. Which tasks
+these are comes from the same remote records.
+\item Terminating the controller, which \code{targets} does when a pipeline ends,
+is interrupted, or stops on an error, stops the idle workers but
+leaves a worker in the middle of a task to finish and save it, as
+after a disconnect. The next session then reuses, waits for, or stops
+each of these runs by the rules above. \code{terminate_orphans()}, called
+from a later session, stops them all at once.
 }
 
 A session is gone when the remote end of its tunnel has stopped, or,
@@ -378,10 +406,21 @@ back.
 
 A task is identified by its name and by everything it computes from: the
 command, data, globals, seed, and packages, or for a \code{targets} target,
-its command, seed, settings, and the hashes of the data it depends on. A
-task pushed without a name, as \code{push()} allows, runs without salvage.
-Salvage assumes a task gives the same result each time it runs with the
-same inputs, which \code{targets} arranges by seeding every target.
+its command, seed, settings, the hashes of the data it depends on, and
+the globals it uses: those its command names, and in turn those that
+each of them refers to. A function refers to the globals \code{targets} finds
+in its code, to any whose name appears in it as a string, as in
+\code{do.call("g", ...)}, and to those the functions in its enclosing
+environment refer to; a list, an environment (an R6 object or generator
+among them), or an S4 object refers to those its functions refer to.
+That covers every global \code{targets} reruns a target for, and some it
+cannot see. A change to any other global, such as an unrelated function
+in \verb{_targets.R}, leaves the key as it was; so does a change to the
+pipeline's options, such as its controller. With \code{tar_option_set(envir = )} set to an environment other than the global one, \code{targets} ships that
+whole environment, and any change to it changes every key. A task pushed
+without a name, as \code{push()} allows, runs without salvage. Salvage assumes
+a task gives the same result each time it runs with the same inputs,
+which \code{targets} arranges by seeding every target.
 
 A saved result is deleted once a controller collects it with \code{pop()},
 \code{collect()}, or \code{map()}. Results nothing collects stay until the

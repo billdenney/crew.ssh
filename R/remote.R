@@ -21,7 +21,12 @@
 # `states`, when given, limits the workers to those whose latest task is in one
 # of these states, and skips the others before the process and container
 # checks, which over many old sessions are what take the time.
-remote_workers_script <- function(remote_directory, states = NULL) {
+#
+# `saved`, when given, is the salvage directory: after the workers, a line
+# "crew-ssh-saved:" and then the key of each result saved there, one per line,
+# which remote_workers_split() reads back.
+remote_workers_script <- function(remote_directory, states = NULL,
+                                  saved = NULL) {
   filter <- if (is.null(states)) {
     character(0L)
   } else {
@@ -57,6 +62,7 @@ remote_workers_script <- function(remote_directory, states = NULL) {
     "      *\"$s\"*) sa=TRUE ;;",
     "    esac",
     "  fi",
+    "  [ -e \"${d}ended\" ] && sa=FALSE",
     "  for p in \"$d\"worker-*.pid; do",
     "    [ -f \"$p\" ] || continue",
     "    w=$(basename \"$p\" .pid)",
@@ -84,9 +90,34 @@ remote_workers_script <- function(remote_directory, states = NULL) {
     "    echo",
     "  done",
     "done",
+    if (is.null(saved)) {
+      character(0L)
+    } else {
+      c(
+        "echo 'crew-ssh-saved:'",
+        paste0("for f in ", shQuote(saved, type = "sh"), "/*.rds; do"),
+        "  [ -f \"$f\" ] && basename \"$f\" .rds",
+        "done"
+      )
+    },
     "exit 0"
   )
   paste(lines, collapse = "\n")
+}
+
+# Split the output of remote_workers_script() with `saved` into the workers'
+# records and the keys of the saved results.
+remote_workers_split <- function(text) {
+  lines <- strsplit(text, "\n", fixed = TRUE)[[1L]]
+  marker <- match("crew-ssh-saved:", lines)
+  if (is.na(marker)) {
+    return(list(workers = text, saved = character(0L)))
+  }
+  saved <- trimws(lines[-seq_len(marker)])
+  list(
+    workers = paste(lines[seq_len(marker - 1L)], collapse = "\n"),
+    saved = saved[nzchar(saved)]
+  )
 }
 
 remote_salvage_script <- function(directory) {
@@ -128,21 +159,140 @@ remote_salvage_script <- function(directory) {
 # the container itself is killed through the runtime, by the ID it recorded.
 # A process ID only counts while its command line still names its session,
 # because the system reuses process IDs.
-remote_stop_script <- function(pids, sessions, cid_files, runtimes) {
+#
+# With `task_files`, the task record of each worker, a worker whose record says
+# it is running a task is left to finish it: with salvage it saves the result
+# once its connection is gone, as after a disconnect. Each one left running is
+# reported on a line beginning "crew-ssh-kept-worker:" while its process or
+# container runs. `ended`, when given, is a file to create first, which marks
+# the session as gone for good, so that later sessions count the workers left
+# running as unreachable whatever its tunnel's remote end and its R process
+# are doing. Written first, it survives stops that run past the ssh timeout;
+# one that cannot be written does not keep the stops from running.
+remote_stop_script <- function(pids, sessions, cid_files, runtimes,
+                               task_files = NULL, ended = NULL) {
   runtimes[is.na(runtimes)] <- ""
-  calls <- paste(
-    "crew_ssh_stop",
+  args <- paste(
     shQuote(pids, type = "sh"),
     shQuote(sessions, type = "sh"),
     shQuote(cid_files, type = "sh"),
     shQuote(runtimes, type = "sh")
   )
+  calls <- if (is.null(task_files)) {
+    paste("crew_ssh_stop", args)
+  } else {
+    paste("crew_ssh_stop_idle", args, shQuote(task_files, type = "sh"))
+  }
+  paste(
+    c(
+      remote_stop_function(),
+      if (is.null(task_files)) character(0L) else remote_stop_idle_function(),
+      # `true`, not the special builtin `:`, whose failed redirection would
+      # end a POSIX shell before the stops.
+      if (is.null(ended)) {
+        character(0L)
+      } else {
+        paste0("{ true > ", shQuote(ended, type = "sh"), "; } 2>/dev/null || true")
+      },
+      calls,
+      "exit 0"
+    ),
+    collapse = "\n"
+  )
+}
+
+# crew_ssh_stop_idle PID SESSION CID_FILE RUNTIME TASK_FILE: crew_ssh_stop,
+# unless TASK_FILE says the worker is running a task, in which case it is left
+# alone, and reported if its process or container runs.
+remote_stop_idle_function <- function() {
+  paste(
+    "crew_ssh_stop_idle() {",
+    "  if [ -f \"$5\" ] && grep -qx 'task_state: running' \"$5\"; then",
+    "    alive=",
+    "    case \"$(ps -p \"$1\" -o args= 2>/dev/null)\" in",
+    "      *\"$2\"*) alive=TRUE ;;",
+    "    esac",
+    "    if [ -n \"$4\" ] && [ -s \"$3\" ]; then",
+    "      r=$(\"$4\" inspect --format '{{.State.Running}}' \\",
+    "        \"$(cat \"$3\")\" 2>/dev/null) && [ \"$r\" = true ] && alive=TRUE",
+    "    fi",
+    "    [ -n \"$alive\" ] && printf 'crew-ssh-kept-worker: %s %s\\n' \\",
+    "      \"$(basename \"$5\" .task)\" \"$(sed -n 's/^task_name: //p' \"$5\")\"",
+    "    return 0",
+    "  fi",
+    "  crew_ssh_stop \"$1\" \"$2\" \"$3\" \"$4\"",
+    "}",
+    sep = "\n"
+  )
+}
+
+# The workers remote_stop_script() reports leaving to finish their task, each
+# as "<worker> (<task>)".
+remote_kept_workers <- function(output) {
+  remote_reported(output, "crew-ssh-kept-worker", fields = 1L)
+}
+
+# Stop the workers of `tasks`, a remote_unreachable_tasks() frame, which run a
+# task this controller has since pushed again with a different key: the task
+# changed while they ran, so nothing will ever collect their result. Each
+# worker's task record is read just before the stop, so one that has moved on
+# from that key, or finished it, is left alone. The lock of each stopped task
+# is removed with it. Each stopped worker is reported on a line beginning
+# "crew-ssh-stopped-obsolete:".
+remote_stop_obsolete_script <- function(tasks, salvage_directory) {
+  runtimes <- tasks$runtime
+  runtimes[is.na(runtimes)] <- ""
+  calls <- paste(
+    "crew_ssh_stop_obsolete",
+    shQuote(tasks$session_directory, type = "sh"),
+    shQuote(tasks$worker, type = "sh"),
+    shQuote(tasks$session, type = "sh"),
+    shQuote(tasks$pid, type = "sh"),
+    shQuote(runtimes, type = "sh"),
+    shQuote(tasks$task_key, type = "sh")
+  )
   paste(
     remote_stop_function(),
+    paste0("salvage=", shQuote(salvage_directory, type = "sh")),
+    "crew_ssh_stop_obsolete() {",
+    "  t=\"$1/$2.task\"",
+    "  [ -f \"$t\" ] || return 0",
+    "  grep -qxF \"task_key: $6\" \"$t\" || return 0",
+    "  grep -qx 'task_state: running' \"$t\" || return 0",
+    "  crew_ssh_stop \"$4\" \"$3\" \"$1/$2.cid\" \"$5\"",
+    "  rm -rf -- \"$salvage/$6.lock\"",
+    "  printf 'crew-ssh-stopped-obsolete: %s %s %s\\n' \"$3\" \"$2\" \\",
+    "    \"$(sed -n 's/^task_name: //p' \"$t\")\"",
+    "}",
     paste(calls, collapse = "\n"),
     "exit 0",
     sep = "\n"
   )
+}
+
+# The workers remote_stop_obsolete_script() reports stopping, each as
+# "<worker> of <session> (<task>)".
+remote_stopped_obsolete <- function(output) {
+  remote_reported(output, "crew-ssh-stopped-obsolete", fields = 2L)
+}
+
+# The lines of `output` that begin "<tag>: ", each read as `fields` words that
+# name a worker, "<worker>" or "<session> <worker>", then a task name, which
+# may be empty. Each becomes "<worker>" or "<worker> of <session>", with
+# " (<task>)" after it when there is a task.
+remote_reported <- function(output, tag, fields) {
+  words <- paste(rep("(\\S+)", fields), collapse = " ")
+  pattern <- paste0("^", tag, ": ", words, " ?(.*)$")
+  lines <- grep(pattern, trimws(output), value = TRUE, perl = TRUE)
+  labels <- if (fields == 1L) {
+    sub(pattern, "\\1", lines, perl = TRUE)
+  } else {
+    sub(pattern, "\\2 of \\1", lines, perl = TRUE)
+  }
+  tasks <- sub(pattern, paste0("\\", fields + 1L), lines, perl = TRUE)
+  named <- nzchar(tasks)
+  labels[named] <- paste0(labels[named], " (", tasks[named], ")")
+  labels
 }
 
 # crew_ssh_stop PID SESSION CID_FILE RUNTIME, as remote_stop_script() and
@@ -197,6 +347,7 @@ remote_stop_waiters_script <- function(remote_directory, session,
     "  s=$(basename \"$d\")",
     "  ended=",
     "  case \" $dead \" in *\" $s \"*) ended=TRUE ;; esac",
+    "  [ -e \"${d}ended\" ] && ended=TRUE",
     "  if [ -n \"$ended\" ] && [ -s \"${d}tunnel.pid\" ]; then",
     "    tp=$(cat \"${d}tunnel.pid\")",
     "    case \"$(ps -p \"$tp\" -o args= 2>/dev/null)\" in",
@@ -237,11 +388,15 @@ remote_stop_waiters_script <- function(remote_directory, session,
   )
 }
 
-# The tasks still running on workers the controller cannot reach, as a data
-# frame of their `task_key` and `task_name`: tasks of workers of other
-# sessions whose tunnel is gone, and of this session's workers named in
-# `disconnected`, which it launched before its tunnel was last reopened.
-# `workers` is a remote_workers_frame().
+# The tasks still running on workers the controller cannot reach: tasks of
+# workers of other sessions whose tunnel is gone, and of this session's workers
+# named in `disconnected`, which it launched before its tunnel was last
+# reopened. `workers` is a remote_workers_frame(). One row per task, with the
+# worker running it, how its key was computed (`task_scheme` and
+# `task_hasher`), the project that pushed it (`task_scope`), each NA in a
+# record from a crew.ssh that did not write it, and whether a reachable worker
+# of this session has taken the task over (`claimed`), waiting for its result
+# or running it.
 remote_unreachable_tasks <- function(workers, disconnected) {
   cut_off <- ifelse(
     workers$current,
@@ -252,23 +407,39 @@ remote_unreachable_tasks <- function(workers, disconnected) {
     workers$task_state %in% "running" &
     !is.na(workers$task_key) &
     cut_off
-  out <- workers[running, c("task_key", "task_name"), drop = FALSE]
+  holding <- workers$alive &
+    workers$task_state %in% c("running", "waiting") &
+    workers$current &
+    !(workers$worker %in% disconnected)
+  columns <- c(
+    "task_key", "task_name", "task_scheme", "task_hasher", "task_scope",
+    "session", "session_directory", "worker", "pid", "runtime"
+  )
+  out <- workers[running, columns, drop = FALSE]
   out <- out[!duplicated(out$task_key), , drop = FALSE]
+  out$claimed <- out$task_key %in% workers$task_key[holding]
   rownames(out) <- NULL
   out
+}
+
+# remote_unreachable_tasks() with no tasks, as a controller starts out.
+remote_unreachable_none <- function() {
+  remote_unreachable_tasks(
+    workers = remote_workers_frame(
+      text = "",
+      host = character(0L),
+      remote_directory = character(0L),
+      session = character(0L)
+    ),
+    disconnected = character(0L)
+  )
 }
 
 # The workers remote_stop_waiters_script() reports in `output`, each as
 # "<worker> of <session> (<task>)", or without the task when its record
 # names none.
 remote_stopped_waiters <- function(output) {
-  pattern <- "^crew-ssh-stopped-waiter: (\\S+) (\\S+) ?(.*)$"
-  lines <- grep(pattern, trimws(output), value = TRUE, perl = TRUE)
-  labels <- sub(pattern, "\\2 of \\1", lines, perl = TRUE)
-  tasks <- sub(pattern, "\\3", lines, perl = TRUE)
-  named <- nzchar(tasks)
-  labels[named] <- paste0(labels[named], " (", tasks[named], ")")
-  labels
+  remote_reported(output, "crew-ssh-stopped-waiter", fields = 2L)
 }
 
 # The sessions whose lingering tunnel end remote_stop_waiters_script()
@@ -403,6 +574,9 @@ remote_workers_frame <- function(text, host, remote_directory, session) {
     task_key = remote_field(records, "task_key", rows),
     task_name = remote_field(records, "task_name", rows),
     task_state = remote_field(records, "task_state", rows),
+    task_scheme = as.integer(remote_field(records, "task_scheme", rows)),
+    task_hasher = remote_field(records, "task_hasher", rows),
+    task_scope = remote_field(records, "task_scope", rows),
     task_started = remote_epoch(remote_field(records, "task_started", rows)),
     task_ended = remote_epoch(remote_field(records, "task_ended", rows)),
     task_updated = remote_epoch(remote_field(records, "task_updated", rows)),

@@ -353,17 +353,46 @@ pushes whatever its scheduler reaches first, and it keeps going down a branch
 of the pipeline it has started before it turns to targets waiting for a free
 worker. Meanwhile the old workers are still computing, so they count against
 `workers`: with two old workers still busy and `workers = 2`, the new session
-launches none of its own until one of them finishes, and it says so. Once the
-new session pushes an in-flight target again, the worker that takes it holds
-the slot instead, handing back the saved result at once or waiting for the old
-worker to finish. The remote machine never runs more tasks at once than
+launches none of its own until one of them finishes, and it says so. Once a
+worker of the new session takes an in-flight target over, handing back the
+saved result at once or waiting for the old worker to finish, that worker
+holds the slot instead. The remote machine never runs more tasks at once than
 `workers`, and no finished work is computed twice.
+
+To keep in-flight targets from waiting on that slot, the new session pushes
+them ahead of everything else that `targets` holds back for a free worker,
+even while its workers are all taken. A saved result then comes back, and a
+run in progress is attached to, as soon as `targets` reaches the target.
+
+### Stopping and changing a pipeline
+
+Stopping `tar_make()` yourself, or a stop on an error, keeps the remote work
+too: terminating the controller stops the idle workers but leaves each busy
+one to finish and save its target, just as a dropped connection would. What
+the next run does with that work depends on what you changed in between:
+
+* **Something the target does not use**, such as another target, a function
+  only other targets call, or the controller's settings: the target matches,
+  so the next run waits for the old run or reuses its result. A target is
+  matched by the functions and objects of `_targets.R` it uses, directly or
+  through the functions it calls, including functions called by name (as in
+  `do.call("g", ...)`) or kept in lists and R6 objects, so the rest of
+  `_targets.R` can change freely.
+* **Something the target uses**, such as its command, a function it calls, or
+  the data of an upstream target: the old run computes a result nothing will
+  collect. When the next run pushes the target, it stops that run, says so,
+  and runs the new version in its place. A run it never pushes, such as that
+  of a removed target or of a dynamic branch whose name changed with its
+  data, is left to finish and counts against `workers` until then.
+
+`launcher$terminate_orphans()`, from a later session, stops every worker left
+running without waiting for that.
 
 Salvage only reuses what would be correct to reuse:
 
-* A target is matched by its name, command, seed, settings, and the hashes of
-  the data it depends on, and by the functions and objects of `_targets.R`, so
-  a target whose code or upstream data changed runs again.
+* A target is matched by its name, command, seed, settings, the hashes of the
+  data it depends on, and the functions and objects of `_targets.R` it uses,
+  so a target whose code or upstream data changed runs again.
 * A target that errored runs again, as it would under `targets` alone.
 * A result computed under a different version of R or of any package on the
   remote machine runs again, so rebuilding a container image with a fix takes
