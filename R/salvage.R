@@ -19,13 +19,34 @@
 
 # Controller side ----
 
+# The version of the way keys are computed. Each worker records it with its
+# task, with the versions of R and rlang that hashed the key (see
+# salvage_hasher()), so a controller compares a key only with keys computed
+# the same way: a key computed otherwise names the same task differently, and
+# its run is never taken for a changed task (see the "Surviving a disconnect"
+# section of crew_controller_ssh()). A task record without a scheme comes from
+# a crew.ssh that did not record one, whose keys are not comparable. A test
+# pins a key literally, so a change to how keys are computed fails it until
+# this number goes up.
+salvage_scheme <- 2L
+
+# What hashes a key besides crew.ssh's own code: rlang::hash() may change
+# between rlang versions, and serialization between R versions.
+salvage_hasher <- function() {
+  paste0(
+    "R ", R.version$major, ".", R.version$minor,
+    ", rlang ", utils::packageVersion("rlang")
+  )
+}
+
 # The key of a task: a readable prefix from the task name and a hash of
 # everything the task computes from. Two pushes get the same key exactly when
 # they would compute the same thing, so a saved result can stand in for a run.
+# `globals` is a salvage_globals_cache().
 salvage_key <- function(
   command,
   data,
-  globals_hash,
+  globals,
   seed,
   algorithm,
   packages,
@@ -37,7 +58,7 @@ salvage_key <- function(
     salvage_fingerprint_targets(
       data = data,
       name = name,
-      globals_hash = globals_hash,
+      globals = globals,
       visited = visited
     )
   } else {
@@ -46,7 +67,7 @@ salvage_key <- function(
       name = name,
       command = salvage_canonical(command, visited),
       data = salvage_canonical(data, visited),
-      globals = globals_hash,
+      globals = salvage_globals_hash(globals),
       seed = seed,
       algorithm = algorithm,
       packages = packages,
@@ -57,13 +78,212 @@ salvage_key <- function(
 }
 
 # targets ships the whole global environment of `_targets.R` with every task,
-# so the hash of the globals is computed once and reused while they stay the
-# same object. `.Random.seed` changes whenever the local session draws a
-# random number and does not change what a task computes: crew and targets
-# seed each task themselves.
-salvage_globals_hash <- function(globals) {
-  globals <- globals[setdiff(names(globals), ".Random.seed")]
-  rlang::hash(salvage_canonical(globals, salvage_visited()))
+# so hashes of the globals are computed once and kept here while the same
+# globals are pushed: the hash of all of them, and the hash and the global
+# dependencies of each one that a task needs.
+salvage_globals_cache <- function(globals) {
+  cache <- new.env(parent = emptyenv())
+  cache$globals <- globals
+  cache$all <- NULL
+  cache$hashes <- new.env(hash = TRUE, parent = emptyenv())
+  cache$deps <- new.env(hash = TRUE, parent = emptyenv())
+  cache$enclosures <- new.env(hash = TRUE, parent = emptyenv())
+  cache
+}
+
+# `.Random.seed` changes whenever the local session draws a random number and
+# does not change what a task computes: crew and targets seed each task
+# themselves.
+salvage_globals_names <- function(cache) {
+  setdiff(names(cache$globals), ".Random.seed")
+}
+
+# The hash of every global, for a task that does not say which it uses.
+salvage_globals_hash <- function(cache) {
+  if (is.null(cache$all)) {
+    globals <- cache$globals[salvage_globals_names(cache)]
+    cache$all <- rlang::hash(salvage_canonical(globals, salvage_visited()))
+  }
+  cache$all
+}
+
+# The hashes of the globals a target depends on, named by global: those its
+# command names, and in turn those each of them refers to (see
+# salvage_value_deps()). This covers every global targets reruns a target for,
+# and more, so a change that alters the target's result changes its key, and a
+# change to any other global leaves the key alone.
+salvage_globals_target <- function(deps, cache) {
+  available <- salvage_globals_names(cache)
+  todo <- intersect(as.character(deps), available)
+  seen <- character(0L)
+  while (length(todo)) {
+    name <- todo[[1L]]
+    todo <- todo[-1L]
+    if (name %in% seen) {
+      next
+    }
+    seen <- c(seen, name)
+    more <- intersect(salvage_global_deps(name, cache), available)
+    todo <- c(todo, setdiff(more, seen))
+  }
+  seen <- sort(seen, method = "radix")
+  vapply(seen, salvage_global_hash, character(1L), cache = cache)
+}
+
+salvage_global_hash <- function(name, cache) {
+  hash <- get0(name, envir = cache$hashes, inherits = FALSE)
+  if (is.null(hash)) {
+    value <- cache$globals[[name]]
+    hash <- rlang::hash(salvage_canonical(value, salvage_visited()))
+    assign(name, hash, envir = cache$hashes)
+  }
+  hash
+}
+
+# A global whose dependencies cannot be read depends on every global, which
+# can only rerun a task that a narrower key would have reused.
+salvage_global_deps <- function(name, cache) {
+  deps <- get0(name, envir = cache$deps, inherits = FALSE)
+  if (is.null(deps)) {
+    deps <- tryCatch(
+      salvage_value_deps(cache$globals[[name]], salvage_visited(), cache),
+      error = identity
+    )
+    if (inherits(deps, "error")) {
+      deps <- salvage_globals_names(cache)
+    }
+    assign(name, deps, envir = cache$deps)
+  }
+  deps
+}
+
+# The names a value refers to, some of which may be globals; the caller keeps
+# those. A function refers to what targets' reading of its code finds
+# (targets::tar_deps_raw()), to every string constant in its body and default
+# arguments, since do.call("g", ...), match.fun("g") and get("g") reach a
+# global by a string, and to what the functions in its enclosing environment
+# refer to. A list, an environment (an R6 object or generator among them), an
+# S4 object, and the attributes of anything refer to what the functions inside
+# them refer to, which targets cannot see. A primitive, data, and the
+# environments of R itself and of packages refer to nothing here. With `cache`,
+# as for a global itself, the enclosing environment of a function is read once
+# for all the globals that share it (see salvage_enclosure_deps()).
+salvage_value_deps <- function(x, visited, cache = NULL) {
+  if (!salvage_needs_canonical(x)) {
+    return(character(0L))
+  }
+  type <- typeof(x)
+  if (identical(type, "closure")) {
+    x <- utils::removeSource(x)
+  }
+  deps <- if (identical(type, "closure")) {
+    c(
+      # codetools warns about some uses of `...` it cannot place, which says
+      # nothing about the names the code refers to.
+      suppressWarnings(targets::tar_deps_raw(x)),
+      salvage_code_strings(body(x)),
+      salvage_code_strings(formals(x)),
+      if (is.null(cache)) {
+        salvage_value_deps(environment(x), visited)
+      } else {
+        salvage_enclosure_deps(environment(x), cache)
+      }
+    )
+  } else if (identical(type, "environment")) {
+    salvage_environment_deps(x, visited)
+  } else if (identical(type, "list")) {
+    unlist(
+      lapply(unclass(x), salvage_value_deps, visited = visited),
+      use.names = FALSE
+    )
+  } else {
+    character(0L)
+  }
+  attributes <- attributes(x)
+  if (!identical(type, "environment") && !is.null(attributes)) {
+    deps <- c(
+      deps,
+      unlist(
+        lapply(attributes, salvage_value_deps, visited = visited),
+        use.names = FALSE
+      )
+    )
+  }
+  unique(as.character(deps))
+}
+
+# Each environment is read once, as salvage_canonical_environment() reads it,
+# skipping those of R itself and of packages, and crew controllers.
+salvage_environment_deps <- function(x, visited) {
+  if (
+    !is.null(salvage_environment_name(x)) ||
+      inherits(x, c("crew_class_controller", "crew_class_controller_group"))
+  ) {
+    return(character(0L))
+  }
+  address <- rlang::obj_address(x)
+  if (!is.null(visited[[address]])) {
+    return(character(0L))
+  }
+  assign(address, TRUE, envir = visited)
+  names <- ls(x, all.names = TRUE)
+  values <- lapply(names, salvage_binding_value, environment = x)
+  c(
+    unlist(
+      lapply(values, salvage_value_deps, visited = visited),
+      use.names = FALSE
+    ),
+    salvage_value_deps(attributes(x), visited)
+  )
+}
+
+# Functions sourced into one environment, or made by one factory, share their
+# enclosing environment, so what it refers to, everything reachable from it,
+# is read once for each set of globals pushed.
+salvage_enclosure_deps <- function(environment, cache) {
+  if (!is.null(salvage_environment_name(environment))) {
+    return(character(0L))
+  }
+  address <- rlang::obj_address(environment)
+  deps <- get0(address, envir = cache$enclosures, inherits = FALSE)
+  if (is.null(deps)) {
+    deps <- salvage_environment_deps(environment, salvage_visited())
+    assign(address, deps, envir = cache$enclosures)
+  }
+  deps
+}
+
+# The string constants in code, a call, a pairlist such as a function's
+# formals, an expression, or a constant. The walk keeps its own stack, so code
+# nested deeper than R's evaluation depth is read too. An empty argument, as in
+# x[, 1] or a formal without a default, is passed only to typeof(), since
+# binding it to a variable would make reading the variable an error.
+salvage_code_strings <- function(code) {
+  if (is.character(code)) {
+    return(code)
+  }
+  walked <- c("language", "pairlist", "expression", "list")
+  if (!(typeof(code) %in% walked)) {
+    return(character(0L))
+  }
+  out <- character(0L)
+  stack <- list(code)
+  while (length(stack)) {
+    top <- stack[[length(stack)]]
+    stack[[length(stack)]] <- NULL
+    if (is.character(top)) {
+      out <- c(out, top)
+      next
+    }
+    # Pushed last to first, so the strings come out in the order of the code.
+    parts <- as.list(top)
+    for (index in rev(seq_along(parts))) {
+      if (typeof(parts[[index]]) %in% c("character", walked)) {
+        stack[[length(stack) + 1L]] <- parts[[index]]
+      }
+    }
+  }
+  unique(out)
 }
 
 salvage_is_targets <- function(command, data) {
@@ -77,9 +297,13 @@ salvage_is_targets <- function(command, data) {
 # upstream target reruns, even with an identical value (for example under
 # `tar_cue(mode = "always")`), so the target object is not hashed as a whole.
 # The fingerprint takes the fields that decide what the target computes:
-# its command, seed, storage settings, and the hashes of the data it depends
-# on.
-salvage_fingerprint_targets <- function(data, name, globals_hash, visited) {
+# its command, seed, storage settings, and the hashes of the data and of the
+# globals it depends on. The pipeline's options and environment variables,
+# which targets also ships, are left out, as targets leaves them out when it
+# decides whether a target is up to date: they set how the worker runs, such
+# as its memory and error handling, and every one that changes a value is
+# copied into the target's own settings when the target is defined.
+salvage_fingerprint_targets <- function(data, name, globals, visited) {
   target <- .subset2(data, "target")
   command <- .subset2(target, "command")
   settings <- .subset2(target, "settings")
@@ -92,15 +316,26 @@ salvage_fingerprint_targets <- function(data, name, globals_hash, visited) {
       "targets may store targets differently; set salvage = FALSE."
     )
   )
+  # Without its dependencies, the key would follow no global at all.
+  deps <- .subset2(target, "deps")
+  crew::crew_assert(
+    is.character(deps) && !anyNA(deps),
+    message = paste(
+      "crew.ssh salvage cannot read the dependencies of target",
+      shQuote(name), "from the task targets pushed. This version of",
+      "targets may store targets differently; set salvage = FALSE."
+    )
+  )
   list(
     kind = "targets",
+    scheme = salvage_scheme,
     name = name,
     target = .subset2(settings, "name"),
     command = hash,
     packages = .subset2(command, "packages"),
     library = .subset2(command, "library"),
     seed = .subset2(target, "seed"),
-    deps = .subset2(target, "deps"),
+    deps = deps,
     index = .subset2(target, "index"),
     format = .subset2(settings, "format"),
     repository = .subset2(settings, "repository"),
@@ -112,9 +347,7 @@ salvage_fingerprint_targets <- function(data, name, globals_hash, visited) {
     envir = salvage_canonical(.subset2(data, "envir"), visited),
     path_store = .subset2(data, "path_store"),
     fun = .subset2(data, "fun"),
-    options = salvage_canonical(.subset2(data, "options"), visited),
-    envvars = .subset2(data, "envvars"),
-    globals = globals_hash
+    globals = salvage_globals_target(deps, globals)
   )
 }
 
@@ -155,7 +388,14 @@ salvage_upstream_hash <- function(name, upstream) {
 salvage_prefix <- function(name) {
   prefix <- substr(gsub("[^A-Za-z0-9._-]", "_", name), 1L, 64L)
   prefix <- sub("^[.-]+", "", prefix)
-  if (nzchar(prefix)) prefix else "task"
+  prefix[!nzchar(prefix)] <- "task"
+  prefix
+}
+
+# The prefix of each key, salvage_prefix() of its task's name: the key without
+# its trailing "-" and hash.
+salvage_key_prefix <- function(keys) {
+  sub("-[0-9a-f]{32}$", "", keys)
 }
 
 # Canonical form ----
@@ -309,10 +549,14 @@ salvage_canonical_environment <- function(x, visited) {
 # values. Reading a promise runs the code behind it, whose warnings would only
 # confuse at push time.
 salvage_canonical_binding <- function(name, environment, visited) {
+  salvage_canonical(salvage_binding_value(name, environment), visited)
+}
+
+salvage_binding_value <- function(name, environment) {
   if (bindingIsActive(name, environment)) {
     return(list(type = "active binding"))
   }
-  value <- suppressWarnings(
+  suppressWarnings(
     tryCatch(
       if (identical(name, "...")) {
         eval(quote(list(...)), envir = environment)
@@ -322,7 +566,6 @@ salvage_canonical_binding <- function(name, environment, visited) {
       error = identity
     )
   )
-  salvage_canonical(value, visited)
 }
 
 salvage_environment_name <- function(x) {
@@ -385,9 +628,20 @@ salvage_shipped <- function(
       controller = controller,
       seconds_heartbeat = seconds[["heartbeat"]],
       seconds_stale = seconds[["stale"]],
-      seconds_poll = seconds[["poll"]]
+      seconds_poll = seconds[["poll"]],
+      scheme = salvage_scheme,
+      hasher = salvage_hasher(),
+      scope = salvage_scope()
     )
   )
+}
+
+# Which project pushed a task: a hash of the local working directory, which
+# for targets is the project's. A controller stops another session's run of a
+# changed task only within its own project, since two projects that share a
+# remote directory can use the same target names for different work.
+salvage_scope <- function() {
+  rlang::hash(normalizePath(getwd(), winslash = "/", mustWork = FALSE))
 }
 
 salvage_detach <- function(fun) {
@@ -868,7 +1122,10 @@ salvage_state <- function(
     task_key = key,
     task_name = name,
     task_state = state,
-    task_updated = sprintf("%.3f", as.numeric(Sys.time()))
+    task_updated = sprintf("%.3f", as.numeric(Sys.time())),
+    task_scheme = salvage$scheme,
+    task_hasher = salvage$hasher,
+    task_scope = salvage$scope
   )
   if (!is.null(started)) {
     fields$task_started <- sprintf("%.3f", as.numeric(started))

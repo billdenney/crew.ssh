@@ -5,3 +5,6 @@ inst/examples/_targets/
 .claude/
 *.Rcheck/
 *.tar.gz
+
+# testthat writes the failures of a run here.
+tests/testthat/_problems/
