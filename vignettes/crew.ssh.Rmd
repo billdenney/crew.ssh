@@ -386,7 +386,9 @@ the next run does with that work depends on what you changed in between:
   data, is left to finish and counts against `workers` until then.
 
 `launcher$terminate_orphans()`, from a later session, stops every worker left
-running without waiting for that.
+running without waiting for that. To leave none behind to begin with,
+`controller$terminate(keep_running = FALSE)` stops the busy workers too when the
+controller ends; the default, `keep_running = TRUE`, leaves them to finish.
 
 Salvage only reuses what would be correct to reuse:
 

@@ -1190,6 +1190,72 @@ test_that("with salvage, terminate() leaves a busy worker to finish and save its
   expect_identical(count_runs(counter), 1L)
 })
 
+test_that("with salvage, terminate(keep_running = FALSE) stops a busy worker", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  controller <- fake_controller(remote, salvage = TRUE, workers = 2L)
+  on.exit(controller$terminate())
+  controller$start()
+  controller$push(
+    command = held_task(),
+    data = list(counter = counter, release = release),
+    name = "slow",
+    substitute = FALSE
+  )
+  controller$push(command = 6L * 7L, name = "quick")
+  wait_until(
+    {
+      controller$scale()
+      file.exists(counter) && controller$unresolved() < 2L
+    },
+    seconds = 60
+  )
+  wait_until(length(worker_pids(remote)) == 2L, seconds = 60)
+  pids <- worker_pids(remote)
+  busy <- names(task_states(remote))[task_states(remote) == "running"]
+  expect_length(busy, 1L)
+  # no worker is left running, so nothing is reported as left behind
+  expect_no_message(controller$terminate(keep_running = FALSE))
+  wait_until(!any(vapply(pids, pid_alive, logical(1))), seconds = 10)
+  # the choice held for that terminate() only
+  expect_true(isTRUE(controller$launcher$.__enclos_env__$private$.terminate_keep))
+})
+
+test_that("terminate(keep_running =) is TRUE or FALSE", {
+  controller <- crew_controller_ssh(ssh_host = "fakehost", ssh_command = "ssh", remote_directory = "/tmp/x")
+  for (bad in list(NA, "yes", c(TRUE, FALSE), NULL, 1L)) {
+    expect_error(controller$terminate(keep_running = bad), "keep_running must be TRUE or FALSE")
+  }
+  expect_silent(controller$terminate())
+  expect_silent(controller$terminate(keep_running = FALSE))
+})
+
+test_that("without salvage, keep_running changes nothing: the busy worker is stopped", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  started <- file.path(remote, "started")
+  controller <- fake_controller(remote, salvage = FALSE)
+  on.exit(controller$terminate())
+  controller$start()
+  controller$push(
+    command = {
+      file.create(started)
+      Sys.sleep(120)
+    },
+    data = list(started = started)
+  )
+  wait_until({
+    controller$scale()
+    file.exists(started)
+  })
+  pid <- worker_pids(remote)[[1L]]
+  expect_true(pid_alive(pid))
+  controller$terminate(keep_running = TRUE)
+  wait_until(!pid_alive(pid), seconds = 10)
+})
+
 test_that("a worker under a container runtime is found and stopped by its container ID", {
   skip_without_fake_ssh()
   remote <- remote_tempdir()
