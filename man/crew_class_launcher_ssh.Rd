@@ -57,6 +57,7 @@ Other plugin_ssh:
     \item \href{#method-crew_class_launcher_ssh-salvage_collect}{\code{crew_class_launcher_ssh$salvage_collect()}}
     \item \href{#method-crew_class_launcher_ssh-salvage_backlog}{\code{crew_class_launcher_ssh$salvage_backlog()}}
     \item \href{#method-crew_class_launcher_ssh-salvage_passing}{\code{crew_class_launcher_ssh$salvage_passing()}}
+    \item \href{#method-crew_class_launcher_ssh-terminate_keep_running}{\code{crew_class_launcher_ssh$terminate_keep_running()}}
     \item \href{#method-crew_class_launcher_ssh-terminate}{\code{crew_class_launcher_ssh$terminate()}}
   }
 }
@@ -567,6 +568,35 @@ let through, and its push clears it.
 }
 
 \if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-terminate_keep_running"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-terminate_keep_running}{}}}
+\subsection{\code{crew_class_launcher_ssh$terminate_keep_running()}}{
+  Internal: choose whether the next \code{terminate()} leaves a
+worker in the middle of a task to finish it.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$terminate_keep_running(keep_running = TRUE)}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Arguments}{
+    \if{html}{\out{<div class="arguments">}}
+    \describe{
+      \item{\code{keep_running}}{\code{TRUE} (the default) leaves a busy worker running
+when \code{salvage = TRUE}; \code{FALSE} stops every worker.}
+    }
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    The controller's \code{terminate(keep_running =)} calls this; call
+that instead. The choice holds for one \code{terminate()}, then goes back
+to \code{TRUE}.
+  }
+  \subsection{Returns}{
+    \code{NULL} (invisibly).
+  }
+}
+
+\if{html}{\out{<hr>}}
 \if{html}{\out{<a id="method-crew_class_launcher_ssh-terminate"></a>}}
 \if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-terminate}{}}}
 \subsection{\code{crew_class_launcher_ssh$terminate()}}{
@@ -587,7 +617,10 @@ halted by an error, therefore keeps its remote work: a later session
 reuses each saved result, waits for a task still running, and stops a
 run whose task has changed since (see the "Surviving a disconnect"
 section of \code{\link[=crew_controller_ssh]{crew_controller_ssh()}}). \code{terminate_orphans()}, called
-from a later session, stops the workers left running.
+from a later session, stops the workers left running. After the
+controller's \code{terminate(keep_running = FALSE)}, this \code{terminate()}
+stops every worker, and removes the lock and the running record of
+each task it interrupts.
   }
   \subsection{Returns}{
     \code{NULL} (invisibly).

@@ -642,6 +642,23 @@ crew_class_launcher_ssh <- R6::R6Class(
     salvage_passing = function() {
       length(private$.salvage_passes) > 0L
     },
+    #' @description Internal: choose whether the next `terminate()` leaves a
+    #'   worker in the middle of a task to finish it.
+    #' @details The controller's `terminate(keep_running =)` calls this; call
+    #'   that instead. The choice holds for one `terminate()`, then goes back
+    #'   to `TRUE`.
+    #' @param keep_running `TRUE` (the default) leaves a busy worker running
+    #'   when `salvage = TRUE`; `FALSE` stops every worker.
+    #' @return `NULL` (invisibly).
+    terminate_keep_running = function(keep_running = TRUE) {
+      crew::crew_assert(
+        keep_running,
+        isTRUE(.) || isFALSE(.),
+        message = "keep_running must be TRUE or FALSE."
+      )
+      private$.terminate_keep <- keep_running
+      invisible()
+    },
     #' @description Terminate the launcher: stop the remote workers that are
     #'   not busy, delete the saved results this session collected, and close
     #'   the reverse `ssh` tunnel.
@@ -653,10 +670,15 @@ crew_class_launcher_ssh <- R6::R6Class(
     #'   reuses each saved result, waits for a task still running, and stops a
     #'   run whose task has changed since (see the "Surviving a disconnect"
     #'   section of [crew_controller_ssh()]). `terminate_orphans()`, called
-    #'   from a later session, stops the workers left running.
+    #'   from a later session, stops the workers left running. After the
+    #'   controller's `terminate(keep_running = FALSE)`, this `terminate()`
+    #'   stops every worker, and removes the lock and the running record of
+    #'   each task it interrupts.
     #' @return `NULL` (invisibly).
     terminate = function() {
-      private$workers_stop(keep_running = isTRUE(private$.salvage))
+      keep_running <- isTRUE(private$.salvage) && isTRUE(private$.terminate_keep)
+      private$.terminate_keep <- TRUE
+      private$workers_stop(keep_running = keep_running)
       private$salvage_flush(wait = TRUE)
       private$tunnel_stop()
       super$terminate()
@@ -674,6 +696,7 @@ crew_class_launcher_ssh <- R6::R6Class(
     .directory = NULL,
     .remote_directory = NULL,
     .salvage = NULL,
+    .terminate_keep = TRUE,
     .salvage_directory = NULL,
     .seconds_reconnect = NULL,
     # The first and the longest pause between attempts of retry(), in
@@ -1351,7 +1374,8 @@ crew_class_launcher_ssh <- R6::R6Class(
       )
     },
     # Stop this session's workers, or with keep_running = TRUE, those not in
-    # the middle of a task.
+    # the middle of a task. Under salvage, a worker stopped in the middle of a
+    # task leaves neither its lock nor a running record behind.
     workers_stop = function(keep_running = FALSE) {
       handles <- private$.handles
       if (!length(handles)) {
@@ -1359,17 +1383,19 @@ crew_class_launcher_ssh <- R6::R6Class(
       }
       names <- names(handles)
       paths <- private$worker_paths(names)
+      clean <- !keep_running && isTRUE(private$.salvage)
       command <- remote_stop_script(
         pids = vapply(handles, "[[", character(1L), "pid"),
         sessions = rep(private$.session, length(names)),
         cid_files = paths$cid,
         runtimes = rep(private$runtime_name(), length(names)),
-        task_files = if (keep_running) paths$task else NULL,
+        task_files = if (keep_running || clean) paths$task else NULL,
         ended = if (keep_running) {
           paste0(private$.session_directory, "/ended")
         } else {
           NULL
-        }
+        },
+        salvage_directory = if (clean) private$salvage_root() else NULL
       )
       out <- try(
         private$run(command = command, timeout = private$.seconds_timeout),
@@ -1486,6 +1512,15 @@ crew_class_controller_ssh <- R6::R6Class(
   cloneable = FALSE,
   parent_env = asNamespace("crew"),
   public = list(
+    # keep_running = FALSE stops a worker in the middle of a task too, instead of
+    # leaving it to finish and save its result (see the launcher's terminate()).
+    # The choice holds for this call only: crew ends the client before the
+    # launcher, so a client error would otherwise leave it set.
+    terminate = function(controllers = NULL, keep_running = TRUE) {
+      .subset2(.launcher, "terminate_keep_running")(keep_running)
+      on.exit(.subset2(.launcher, "terminate_keep_running")(TRUE), add = TRUE)
+      super$terminate(controllers = controllers)
+    },
     push = function(
       command,
       data = list(),
@@ -1715,7 +1750,15 @@ crew_class_controller_ssh <- R6::R6Class(
 #'      leaves a worker in the middle of a task to finish and save it, as
 #'      after a disconnect. The next session then reuses, waits for, or stops
 #'      each of these runs by the rules above. `terminate_orphans()`, called
-#'      from a later session, stops them all at once.
+#'      from a later session, stops them all at once. So does
+#'      `controller$terminate(keep_running = FALSE)`, which stops every worker,
+#'      busy or not, and removes the lock and the running record of each task
+#'      it interrupts, so a later run of that task does not wait for it. It
+#'      applies when you call `terminate()` on the controller yourself.
+#'      `targets` calls `terminate()` with no arguments, as does
+#'      `terminate()` on a controller group, so they always use the default,
+#'      `keep_running = TRUE`, which keeps the busy workers as described.
+#'      `salvage = FALSE` always stops them.
 #'
 #'   A session is gone when the remote end of its tunnel has stopped, or,
 #'   for a session started on the same machine, when the R process that

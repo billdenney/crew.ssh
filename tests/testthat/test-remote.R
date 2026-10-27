@@ -218,6 +218,70 @@ test_that("remote_stop_script() with task records leaves busy workers running", 
   expect_identical(remote_kept_workers(output), "worker-a (fit worker-a)")
 })
 
+test_that("remote_stop_script() with salvage_directory stops every worker and cleans up its task", {
+  skip_without_sh()
+  remote <- remote_tempdir()
+  salvage <- file.path(remote, "crew-ssh-salvage")
+  dir.create(salvage)
+  workers <- c("worker-a", "worker-b", "worker-c", "worker-d", "worker-e")
+  procs <- lapply(workers, function(.w) process_naming("crew-ssh-mine"))
+  on.exit(for (.p in procs) .p$kill())
+  lock <- function(key, worker, session = "crew-ssh-mine") {
+    path <- file.path(salvage, paste0(key, ".lock"))
+    dir.create(path)
+    writeLines(
+      c(paste("worker:", worker), paste("session:", session)),
+      file.path(path, "owner.dcf")
+    )
+  }
+  # running with its lock; running but another worker holds the lock now;
+  # waiting; finished; running, the lock of another session's worker
+  tasks <- c(
+    task_record(remote, "worker-a", "running", key = "k-a"),
+    task_record(remote, "worker-b", "running", key = "k-b"),
+    task_record(remote, "worker-c", "waiting", key = "k-b"),
+    task_record(remote, "worker-d", "success", key = "k-d"),
+    task_record(remote, "worker-e", "running", key = "k-e")
+  )
+  lock("k-a", "worker-a")
+  lock("k-b", "worker-x")
+  lock("k-d", "worker-d")
+  lock("k-e", "worker-e", session = "crew-ssh-other")
+  output <- run_sh(
+    remote_stop_script(
+      pids = vapply(procs, function(.p) .p$get_pid(), integer(1L)),
+      sessions = rep("crew-ssh-mine", 5L),
+      cid_files = file.path(remote, paste0(workers, ".cid")),
+      runtimes = rep(NA, 5L),
+      task_files = tasks,
+      salvage_directory = salvage
+    )
+  )
+  wait_until(!any(vapply(procs, function(.p) .p$is_alive(), logical(1L))), seconds = 10)
+  # only the lock a stopped worker still owns is removed
+  expect_identical(
+    sort(list.files(salvage, "\\.lock$")),
+    c("k-b.lock", "k-d.lock", "k-e.lock")
+  )
+  # running and waiting records say the worker was interrupted; others stay
+  expect_identical(
+    vapply(tasks, read_task_state, character(1L), USE.NAMES = FALSE),
+    c("interrupted", "interrupted", "interrupted", "success", "interrupted")
+  )
+  expect_length(list.files(remote, "\\.tmp\\."), 0L)
+  expect_identical(remote_kept_workers(output), character(0L))
+  expect_error(
+    remote_stop_script(
+      pids = 1L,
+      sessions = "s",
+      cid_files = "c",
+      runtimes = NA,
+      salvage_directory = salvage
+    ),
+    "task_files is needed"
+  )
+})
+
 test_that("remote_stop_obsolete_script() stops a run only while it still runs that key", {
   skip_without_sh()
   remote <- remote_tempdir()
