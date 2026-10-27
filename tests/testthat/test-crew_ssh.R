@@ -1316,9 +1316,12 @@ test_that("a terminate() that fails part way does not keep the choice for the ne
     "client terminate failed"
   )
   expect_true(pid_alive(pid))
-  # the launcher's own terminate() is the default again: the busy worker stays
+  # the launcher's own terminate() is the default again: the busy worker stays,
+  # with its lock and its running record
   controller$launcher$terminate()
   expect_true(pid_alive(pid))
+  expect_length(list.files(file.path(remote, "crew-ssh-salvage"), "\\.lock$"), 1L)
+  expect_identical(unname(task_states(remote)), "running")
 })
 
 test_that("terminate(keep_running =) is TRUE or FALSE", {
