@@ -382,10 +382,15 @@ is interrupted, or stops on an error, stops the idle workers but
 leaves a worker in the middle of a task to finish and save it, as
 after a disconnect. The next session then reuses, waits for, or stops
 each of these runs by the rules above. \code{terminate_orphans()}, called
-from a later session, stops them all at once, and so does
-\code{controller$terminate(keep_running = FALSE)}, which stops every worker
-when the controller ends. The default, \code{keep_running = TRUE}, keeps the
-busy ones as described; \code{salvage = FALSE} always stops them.
+from a later session, stops them all at once. So does
+\code{controller$terminate(keep_running = FALSE)}, which stops every worker,
+busy or not, and removes the lock and the running record of each task
+it interrupts, so a later run of that task does not wait for it. It
+applies when you call \code{terminate()} on the controller yourself.
+\code{targets} calls \code{terminate()} with no arguments, as does
+\code{terminate()} on a controller group, so they always use the default,
+\code{keep_running = TRUE}, which keeps the busy workers as described.
+\code{salvage = FALSE} always stops them.
 }
 
 A session is gone when the remote end of its tunnel has stopped, or,

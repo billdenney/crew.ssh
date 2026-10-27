@@ -1190,7 +1190,36 @@ test_that("with salvage, terminate() leaves a busy worker to finish and save its
   expect_identical(count_runs(counter), 1L)
 })
 
-test_that("with salvage, terminate(keep_running = FALSE) stops a busy worker", {
+# A controller with salvage that has a task held by one of its workers.
+# Returns the paths a test needs.
+held_controller <- function(remote, workers = 1L) {
+  counter <- file.path(remote, "runs.txt")
+  release <- file.path(remote, "release")
+  controller <- fake_controller(remote, salvage = TRUE, workers = workers)
+  controller$start()
+  list(controller = controller, counter = counter, release = release)
+}
+
+push_held <- function(held, name = "slow") {
+  held$controller$push(
+    command = held_task(),
+    data = list(counter = held$counter, release = held$release),
+    name = name,
+    substitute = FALSE
+  )
+}
+
+wait_for_runs <- function(held, runs) {
+  wait_until(
+    {
+      held$controller$scale()
+      count_runs(held$counter) == runs
+    },
+    seconds = 60
+  )
+}
+
+test_that("with salvage, terminate(keep_running = FALSE) stops a busy worker and cleans up its task", {
   skip_without_fake_ssh()
   remote <- remote_tempdir()
   counter <- file.path(remote, "runs.txt")
@@ -1216,11 +1245,79 @@ test_that("with salvage, terminate(keep_running = FALSE) stops a busy worker", {
   pids <- worker_pids(remote)
   busy <- names(task_states(remote))[task_states(remote) == "running"]
   expect_length(busy, 1L)
+  salvage <- file.path(remote, "crew-ssh-salvage")
+  expect_length(list.files(salvage, "\\.lock$"), 1L)
+  expect_true("running" %in% controller$launcher$salvage_list()$state)
+  session <- other_session(remote, current = NULL)
   # no worker is left running, so nothing is reported as left behind
   expect_no_message(controller$terminate(keep_running = FALSE))
   wait_until(!any(vapply(pids, pid_alive, logical(1))), seconds = 10)
-  # the choice held for that terminate() only
-  expect_true(isTRUE(controller$launcher$.__enclos_env__$private$.terminate_keep))
+  # the stopped task leaves no lock, and its worker's record says it stopped
+  expect_length(list.files(salvage, "\\.lock$"), 0L)
+  expect_identical(task_states(remote)[[busy]], "interrupted")
+  expect_false("running" %in% controller$launcher$salvage_list()$state)
+  # no worker is left to be counted as running, so the session is not marked gone
+  expect_false(file.exists(file.path(remote, session, "ended")))
+})
+
+test_that("terminate(keep_running = FALSE) is for one terminate() only", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  held <- held_controller(remote)
+  controller <- held$controller
+  on.exit({
+    file.create(held$release)
+    controller$terminate()
+  })
+  push_held(held)
+  wait_for_runs(held, 1L)
+  first <- worker_pids(remote)[[1L]]
+  controller$terminate(keep_running = FALSE)
+  wait_until(!pid_alive(first), seconds = 10)
+  # started again, the same task runs at once on a new worker
+  controller$start()
+  push_held(held)
+  wait_for_runs(held, 2L)
+  second <- setdiff(unname(worker_pids(remote)), first)
+  expect_length(second, 1L)
+  # and the default terminate() leaves it running, as before
+  controller$terminate()
+  expect_true(pid_alive(second))
+  file.create(held$release)
+  wait_until(
+    length(list.files(file.path(remote, "crew-ssh-salvage"), "^slow-.*\\.rds$")) == 1L,
+    seconds = 60
+  )
+  wait_until(!pid_alive(second), seconds = 60)
+})
+
+test_that("a terminate() that fails part way does not keep the choice for the next one", {
+  skip_without_fake_ssh()
+  remote <- remote_tempdir()
+  held <- held_controller(remote)
+  controller <- held$controller
+  on.exit({
+    file.create(held$release)
+    try(controller$launcher$terminate(), silent = TRUE)
+  })
+  push_held(held)
+  wait_for_runs(held, 1L)
+  pid <- worker_pids(remote)[[1L]]
+  # crew ends the client before the launcher, so this fails before the launcher
+  # is reached
+  client <- controller$client
+  unlockBinding("terminate", client)
+  assign("terminate", function() stop("client terminate failed"), envir = client)
+  expect_error(
+    controller$terminate(keep_running = FALSE),
+    "client terminate failed"
+  )
+  expect_true(pid_alive(pid))
+  # the launcher's own terminate() is the default again: the busy worker stays
+  controller$launcher$terminate()
+  expect_true(pid_alive(pid))
+  file.create(held$release)
+  wait_until(!pid_alive(pid), seconds = 60)
 })
 
 test_that("terminate(keep_running =) is TRUE or FALSE", {
@@ -1234,26 +1331,30 @@ test_that("terminate(keep_running =) is TRUE or FALSE", {
 
 test_that("without salvage, keep_running changes nothing: the busy worker is stopped", {
   skip_without_fake_ssh()
-  remote <- remote_tempdir()
-  started <- file.path(remote, "started")
-  controller <- fake_controller(remote, salvage = FALSE)
-  on.exit(controller$terminate())
-  controller$start()
-  controller$push(
-    command = {
-      file.create(started)
-      Sys.sleep(120)
-    },
-    data = list(started = started)
-  )
-  wait_until({
-    controller$scale()
-    file.exists(started)
-  })
-  pid <- worker_pids(remote)[[1L]]
-  expect_true(pid_alive(pid))
-  controller$terminate(keep_running = TRUE)
-  wait_until(!pid_alive(pid), seconds = 10)
+  for (keep_running in c(TRUE, FALSE)) {
+    remote <- remote_tempdir()
+    started <- file.path(remote, "started")
+    controller <- fake_controller(remote, salvage = FALSE)
+    controller$start()
+    controller$push(
+      command = {
+        file.create(started)
+        Sys.sleep(120)
+      },
+      data = list(started = started)
+    )
+    wait_until({
+      controller$scale()
+      file.exists(started)
+    })
+    pid <- worker_pids(remote)[[1L]]
+    expect_true(pid_alive(pid))
+    session <- other_session(remote, current = NULL)
+    controller$terminate(keep_running = keep_running)
+    wait_until(!pid_alive(pid), seconds = 10)
+    # nothing was left running, so the session is not marked gone
+    expect_false(file.exists(file.path(remote, session, "ended")), info = keep_running)
+  }
 })
 
 test_that("a worker under a container runtime is found and stopped by its container ID", {

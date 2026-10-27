@@ -571,8 +571,8 @@ let through, and its push clears it.
 \if{html}{\out{<a id="method-crew_class_launcher_ssh-terminate_keep_running"></a>}}
 \if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-terminate_keep_running}{}}}
 \subsection{\code{crew_class_launcher_ssh$terminate_keep_running()}}{
-  Choose whether the next \code{terminate()} leaves a worker in
-the middle of a task to finish it.
+  Internal: choose whether the next \code{terminate()} leaves a
+worker in the middle of a task to finish it.
   \subsection{Usage}{
     \if{html}{\out{<div class="r">}}
     \preformatted{crew_class_launcher_ssh$terminate_keep_running(keep_running = TRUE)}
@@ -587,8 +587,9 @@ when \code{salvage = TRUE}; \code{FALSE} stops every worker.}
     \if{html}{\out{</div>}}
   }
   \subsection{Details}{
-    The controller's \code{terminate(keep_running =)} calls this. The
-choice holds for one \code{terminate()}, then goes back to \code{TRUE}.
+    The controller's \code{terminate(keep_running =)} calls this; call
+that instead. The choice holds for one \code{terminate()}, then goes back
+to \code{TRUE}.
   }
   \subsection{Returns}{
     \code{NULL} (invisibly).
@@ -616,8 +617,10 @@ halted by an error, therefore keeps its remote work: a later session
 reuses each saved result, waits for a task still running, and stops a
 run whose task has changed since (see the "Surviving a disconnect"
 section of \code{\link[=crew_controller_ssh]{crew_controller_ssh()}}). \code{terminate_orphans()}, called
-from a later session, stops the workers left running. The
-controller's \code{terminate(keep_running = FALSE)} stops them all.
+from a later session, stops the workers left running. After the
+controller's \code{terminate(keep_running = FALSE)}, this \code{terminate()}
+stops every worker, and removes the lock and the running record of
+each task it interrupts.
   }
   \subsection{Returns}{
     \code{NULL} (invisibly).
