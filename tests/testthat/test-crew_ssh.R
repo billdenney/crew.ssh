@@ -1296,16 +1296,19 @@ test_that("a terminate() that fails part way does not keep the choice for the ne
   remote <- remote_tempdir()
   held <- held_controller(remote)
   controller <- held$controller
-  on.exit({
-    file.create(held$release)
-    try(controller$launcher$terminate(), silent = TRUE)
-  })
   push_held(held)
   wait_for_runs(held, 1L)
   pid <- worker_pids(remote)[[1L]]
   # crew ends the client before the launcher, so this fails before the launcher
   # is reached
   client <- controller$client
+  original <- client$terminate
+  on.exit({
+    file.create(held$release)
+    assign("terminate", original, envir = client)
+    try(controller$terminate(), silent = TRUE)
+    tools::pskill(pid)
+  })
   unlockBinding("terminate", client)
   assign("terminate", function() stop("client terminate failed"), envir = client)
   expect_error(
@@ -1316,8 +1319,6 @@ test_that("a terminate() that fails part way does not keep the choice for the ne
   # the launcher's own terminate() is the default again: the busy worker stays
   controller$launcher$terminate()
   expect_true(pid_alive(pid))
-  file.create(held$release)
-  wait_until(!pid_alive(pid), seconds = 60)
 })
 
 test_that("terminate(keep_running =) is TRUE or FALSE", {
