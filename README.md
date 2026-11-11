@@ -184,6 +184,84 @@ controller$launcher$terminate_orphans() # stop workers whose session is gone
 
 See `?crew_controller_ssh` for the details.
 
+## Several remote systems
+
+One controller talks to one machine. To spread a pipeline over several,
+put a controller for each into `crew_controller_balanced()`, which chooses
+which one runs each task:
+
+``` r
+controller <- crew.ssh::crew_controller_balanced(
+  crew.ssh::crew_controller_ssh(
+    name = "host1", ssh_host = "user@host1.example.com", workers = 6L
+  ),
+  crew.ssh::crew_controller_ssh(
+    name = "host2", ssh_host = "user@host2.example.com", workers = 8L
+  )
+)
+```
+
+No target needs `resources`: each one goes to the machine that already holds
+its saved or running work, and otherwise to the machine with the most free
+capacity. `crew::crew_controller_group()` does not do this. It sends every task
+to the controller the task names, and to the *first* controller in the group
+when the task names none, so a pipeline that does not label every target would
+leave all but one machine idle.
+
+`workers` is how many tasks that machine should run at once, not how many cores
+it has. Pick it from what each task actually needs; a handful per machine is
+usual.
+
+### Tiers
+
+Machines that are not interchangeable go in **tiers**: a group of controllers
+that can each run the same work. A target names a tier rather than a machine,
+and the balancer picks within it.
+
+``` r
+controller <- crew.ssh::crew_controller_balanced(
+  crew.ssh::crew_controller_ssh(
+    name = "host1", ssh_host = "user@host1.example.com", workers = 6L
+  ),
+  crew.ssh::crew_controller_ssh(
+    name = "host2", ssh_host = "user@host2.example.com", workers = 8L
+  ),
+  crew.ssh::crew_controller_ssh(
+    name = "gpu", ssh_host = "user@host1.example.com", workers = 1L
+  ),
+  tiers = c(gpu = "gpu"),
+  host_workers = c("user@host1.example.com" = 6L)
+)
+
+tar_target(
+  fit, run_on_gpu(data),
+  resources = tar_resources(crew = tar_resources_crew(controller = "gpu"))
+)
+```
+
+A target that names nothing uses the `"default"` tier, which is every
+controller `tiers` does not place elsewhere. Reach for a tier when some targets
+can only run in some places: a machine with a GPU or a locally mounted dataset
+the others lack, a class of target that should get fewer slots than the rest,
+or a metered cloud machine that should only take what the local ones cannot.
+
+When two controllers share a machine, as `host1` and `gpu` do above,
+`host_workers` caps the machine as a whole so its tiers cannot oversubscribe it
+between them. With one controller per machine it is redundant with that
+controller's `workers`; leave it out. Naming one controller instead of a tier
+also works, as an escape hatch for pinning a target to one machine.
+
+Two things to know:
+
+* **A salvaged result is readable only on the machine that saved it**, since
+  the machines do not share a filesystem. The balancer therefore sends a task
+  back to the machine holding its work, ahead of any machine with more room.
+* **Keep the same package versions on every machine.** A result saved under
+  different versions of R or of any package is never reused, so machines that
+  drift apart quietly stop reusing each other's salvaged work and recompute
+  it instead, with no error anywhere. One container image, pulled on each
+  machine, is the easy way (see below).
+
 ## Running workers in a container
 
 `launch_prefix` runs each worker under another command, such as a container
