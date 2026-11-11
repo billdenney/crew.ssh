@@ -39,6 +39,17 @@ Other plugin_ssh:
 \section{Super class}{
 \code{\link[crew:crew_class_launcher]{crew::crew_class_launcher}} -> \code{crew_class_launcher_ssh}
 }
+\section{Active bindings}{
+  \if{html}{\out{<div class="r6-active-bindings">}}
+  \describe{
+    \item{\code{ssh_host}}{The \code{ssh} destination of the remote system, as given to
+\code{\link[=crew_controller_ssh]{crew_controller_ssh()}}. Read-only. A controller group that places
+tasks across several remote systems reads this to tell which of its
+controllers share a machine, since two controllers of the same host
+draw their workers from the same cores and memory.}
+  }
+  \if{html}{\out{</div>}}
+}
 \section{Methods}{
 \subsection{Public methods}{
   \itemize{
@@ -56,6 +67,7 @@ Other plugin_ssh:
     \item \href{#method-crew_class_launcher_ssh-salvage_task}{\code{crew_class_launcher_ssh$salvage_task()}}
     \item \href{#method-crew_class_launcher_ssh-salvage_collect}{\code{crew_class_launcher_ssh$salvage_collect()}}
     \item \href{#method-crew_class_launcher_ssh-salvage_backlog}{\code{crew_class_launcher_ssh$salvage_backlog()}}
+    \item \href{#method-crew_class_launcher_ssh-salvage_holds}{\code{crew_class_launcher_ssh$salvage_holds()}}
     \item \href{#method-crew_class_launcher_ssh-salvage_passing}{\code{crew_class_launcher_ssh$salvage_passing()}}
     \item \href{#method-crew_class_launcher_ssh-terminate}{\code{crew_class_launcher_ssh$terminate()}}
   }
@@ -541,6 +553,40 @@ no \code{ssh} call, and nothing at all when no run or saved result is left.
   \subsection{Returns}{
     Character vector, the names in \code{names} to push first, in their
 order there.
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_launcher_ssh-salvage_holds"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_launcher_ssh-salvage_holds}{}}}
+\subsection{\code{crew_class_launcher_ssh$salvage_holds()}}{
+  Which of the tasks called \code{names} this remote system
+holds a saved result or a running task for.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_launcher_ssh$salvage_holds(names)}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Arguments}{
+    \if{html}{\out{<div class="arguments">}}
+    \describe{
+      \item{\code{names}}{Character vector, the names of the tasks to ask about.}
+    }
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    Unlike \code{salvage_backlog()}, which chooses what to push first
+and records the choice, this only reports. It changes nothing, so a
+controller group may ask every one of its controllers before it
+decides which to push a task to, and send the task to the system
+that already holds its work. A saved result is readable only on the
+system that wrote it, so a task placed elsewhere is computed again.
+  }
+  \subsection{Returns}{
+    Character vector, the names in \code{names} this system holds work
+for, in their order there. Empty when salvage is off, before the
+controller has read the remote system (which it does when it scales),
+or when there is nothing to hold.
   }
 }
 

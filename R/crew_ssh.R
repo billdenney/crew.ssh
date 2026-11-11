@@ -632,6 +632,30 @@ crew_class_launcher_ssh <- R6::R6Class(
       private$.salvage_passes <- first
       first
     },
+    #' @description Which of the tasks called `names` this remote system
+    #'   holds a saved result or a running task for.
+    #' @details Unlike `salvage_backlog()`, which chooses what to push first
+    #'   and records the choice, this only reports. It changes nothing, so a
+    #'   controller group may ask every one of its controllers before it
+    #'   decides which to push a task to, and send the task to the system
+    #'   that already holds its work. A saved result is readable only on the
+    #'   system that wrote it, so a task placed elsewhere is computed again.
+    #' @return Character vector, the names in `names` this system holds work
+    #'   for, in their order there. Empty when salvage is off, before the
+    #'   controller has read the remote system (which it does when it scales),
+    #'   or when there is nothing to hold.
+    #' @param names Character vector, the names of the tasks to ask about.
+    salvage_holds = function(names) {
+      if (!isTRUE(private$.salvage) || !length(names)) {
+        return(character(0L))
+      }
+      running <- private$.unreachable$task_name
+      saved <- private$.salvage_saved
+      if (!length(running) && !length(saved)) {
+        return(character(0L))
+      }
+      names[salvage_has_state(names, running, saved)]
+    },
     #' @description Whether a task chosen by `salvage_backlog()` is still to
     #'   be pushed. The controller calls this from `saturated()`; it is not
     #'   meant to be called directly.
@@ -661,6 +685,16 @@ crew_class_launcher_ssh <- R6::R6Class(
       private$tunnel_stop()
       super$terminate()
       invisible()
+    }
+  ),
+  active = list(
+    #' @field ssh_host The `ssh` destination of the remote system, as given to
+    #'   [crew_controller_ssh()]. Read-only. A controller group that places
+    #'   tasks across several remote systems reads this to tell which of its
+    #'   controllers share a machine, since two controllers of the same host
+    #'   draw their workers from the same cores and memory.
+    ssh_host = function() {
+      private$.ssh_host
     }
   ),
   private = list(
