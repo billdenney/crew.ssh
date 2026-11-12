@@ -148,7 +148,9 @@ With `targets`, this means re-running `tar_make()` after a dropped connection
 picks up the remote targets that were in flight, finished or still running,
 instead of starting them over. The same holds when you stop `tar_make()`
 yourself, or it stops on an error: terminating the controller stops the idle
-workers but leaves the busy ones to finish and save their targets. When the
+workers but leaves the busy ones to finish and save their targets. (To stop
+the busy ones too, call `controller$terminate(keep_running = FALSE)` yourself;
+`tar_make()` always uses the default.) When the
 targets held back for a free worker include ones in flight, those are pushed
 first. Until a worker of the new session takes an in-flight target over, its
 old worker counts against `workers` (unless that target is all the new session

@@ -169,8 +169,19 @@ remote_salvage_script <- function(directory) {
 # running as unreachable whatever its tunnel's remote end and its R process
 # are doing. Written first, it survives stops that run past the ssh timeout;
 # one that cannot be written does not keep the stops from running.
+#
+# With `salvage_directory` (and `task_files`, which it needs), every worker is
+# stopped, and the work of one stopped in the middle of a task is cleaned up:
+# its task lock is removed, so that the same task run again does not wait for
+# a worker that is gone, and its record, like a waiting worker's, is marked
+# "interrupted".
 remote_stop_script <- function(pids, sessions, cid_files, runtimes,
-                               task_files = NULL, ended = NULL) {
+                               task_files = NULL, ended = NULL,
+                               salvage_directory = NULL) {
+  clean <- !is.null(salvage_directory)
+  if (clean && is.null(task_files)) {
+    stop("task_files is needed with salvage_directory.", call. = FALSE)
+  }
   runtimes[is.na(runtimes)] <- ""
   args <- paste(
     shQuote(pids, type = "sh"),
@@ -178,7 +189,9 @@ remote_stop_script <- function(pids, sessions, cid_files, runtimes,
     shQuote(cid_files, type = "sh"),
     shQuote(runtimes, type = "sh")
   )
-  calls <- if (is.null(task_files)) {
+  calls <- if (clean) {
+    paste("crew_ssh_stop_clean", args, shQuote(task_files, type = "sh"))
+  } else if (is.null(task_files)) {
     paste("crew_ssh_stop", args)
   } else {
     paste("crew_ssh_stop_idle", args, shQuote(task_files, type = "sh"))
@@ -186,7 +199,14 @@ remote_stop_script <- function(pids, sessions, cid_files, runtimes,
   paste(
     c(
       remote_stop_function(),
-      if (is.null(task_files)) character(0L) else remote_stop_idle_function(),
+      if (clean) {
+        c(
+          paste0("salvage=", shQuote(salvage_directory, type = "sh")),
+          remote_stop_clean_function()
+        )
+      } else if (!is.null(task_files)) {
+        remote_stop_idle_function()
+      },
       # `true`, not the special builtin `:`, whose failed redirection would
       # end a POSIX shell before the stops.
       if (is.null(ended)) {
@@ -221,6 +241,39 @@ remote_stop_idle_function <- function() {
     "    return 0",
     "  fi",
     "  crew_ssh_stop \"$1\" \"$2\" \"$3\" \"$4\"",
+    "}",
+    sep = "\n"
+  )
+}
+
+# crew_ssh_stop_clean PID SESSION CID_FILE RUNTIME TASK_FILE: crew_ssh_stop,
+# then, for a worker whose record says it was running a task, the removal of
+# that task's lock (only while the lock still names this worker and session,
+# since a worker that took the task over holds it now) and, for a worker whose
+# record says it was running or waiting, the record marked "interrupted".
+remote_stop_clean_function <- function() {
+  paste(
+    "crew_ssh_stop_clean() {",
+    "  k=",
+    "  if [ -f \"$5\" ] && grep -qx 'task_state: running' \"$5\"; then",
+    "    k=$(sed -n 's/^task_key: //p' \"$5\")",
+    "  fi",
+    "  crew_ssh_stop \"$1\" \"$2\" \"$3\" \"$4\"",
+    "  if [ -n \"$k\" ]; then",
+    "    l=\"$salvage/$k.lock\"",
+    "    w=$(basename \"$5\" .task)",
+    "    if grep -qxF \"worker: $w\" \"$l/owner.dcf\" 2>/dev/null &&",
+    "      grep -qxF \"session: $2\" \"$l/owner.dcf\" 2>/dev/null; then",
+    "      rm -rf -- \"$l\"",
+    "    fi",
+    "  fi",
+    "  if [ -f \"$5\" ] && grep -qxF -e 'task_state: running' \\",
+    "    -e 'task_state: waiting' \"$5\"; then",
+    "    sed -e 's/^task_state: running$/task_state: interrupted/' \\",
+    "      -e 's/^task_state: waiting$/task_state: interrupted/' \\",
+    "      \"$5\" > \"$5.tmp.$$\" && mv -f \"$5.tmp.$$\" \"$5\"",
+    "  fi",
+    "  return 0",
     "}",
     sep = "\n"
   )
