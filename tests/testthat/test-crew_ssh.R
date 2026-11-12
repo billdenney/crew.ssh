@@ -77,8 +77,8 @@ test_that("parse_url() splits a dispatcher URL on the last colon", {
     list(scheme = "tcp", host = "127.0.0.1", port = "5000")
   )
   expect_equal(
-    private$parse_url("tls+tcp://192.168.0.155:44271"),
-    list(scheme = "tls+tcp", host = "192.168.0.155", port = "44271")
+    private$parse_url("tls+tcp://203.0.113.5:44271"),
+    list(scheme = "tls+tcp", host = "203.0.113.5", port = "44271")
   )
   expect_equal(
     private$parse_url("tcp://[::1]:5000"),

@@ -135,6 +135,118 @@ machine. Targets with no `resources` of their own fall back to the
 `tar_option_set()` default, so the local controller stays the default and only
 the targets you mark travel.
 
+## Spread one pipeline over several machines
+
+`crew_controller_group()` routes: a task goes to the controller it names, and
+to the *first* controller in the group when it names none. That is what the
+section above relies on, and it is fine when you decide target by target where
+work belongs. It stops being fine with more than one remote machine, because
+every target that names nothing lands on the same one and the others stay
+idle, while a target pinned to a busy machine waits with another machine free.
+
+`crew_controller_balanced()` chooses instead:
+
+```{r}
+tar_option_set(
+  storage = "main",
+  retrieval = "main",
+  controller = crew.ssh::crew_controller_balanced(
+    crew.ssh::crew_controller_ssh(
+      name = "host1", ssh_host = "user@host1.example.com", workers = 6L
+    ),
+    crew.ssh::crew_controller_ssh(
+      name = "host2", ssh_host = "user@host2.example.com", workers = 8L
+    )
+  )
+)
+```
+
+That is the whole configuration: no target needs `resources`. Each task goes to
+the machine that already holds its saved or running work, and otherwise to the
+controller with the most free capacity, counting the workers it is allowed
+against the tasks it holds. Ties go to the controller you listed first, which
+is how a cheap machine fills before a metered one.
+
+### Choosing `workers`
+
+`workers` is how many tasks you want that machine running at once, not how many
+cores it has. A model fit that compiles before it runs may need several GB for
+a short while and a processor for a long while, so the number that matters is
+usually how many fits the machine should carry, not how much of any one
+resource they use. A handful per machine is usual.
+
+Set it too high and the machine thrashes; set it too low and it idles. Neither
+is dangerous: `workers` caps the worker processes a machine runs, and the
+balancer simply keeps those slots full.
+
+### Tiers, for machines that differ
+
+When some targets can only run in some places, put those controllers in a
+**tier** — a set of controllers that can each run the same work — and name the
+tier on the targets that need it.
+
+```{r}
+tar_option_set(
+  storage = "main",
+  retrieval = "main",
+  controller = crew.ssh::crew_controller_balanced(
+    crew.ssh::crew_controller_ssh(
+      name = "host1", ssh_host = "user@host1.example.com", workers = 6L
+    ),
+    crew.ssh::crew_controller_ssh(
+      name = "host2", ssh_host = "user@host2.example.com", workers = 8L
+    ),
+    crew.ssh::crew_controller_ssh(
+      name = "gpu", ssh_host = "user@host1.example.com", workers = 1L
+    ),
+    tiers = c(gpu = "gpu"),
+    host_workers = c("user@host1.example.com" = 6L)
+  )
+)
+
+tar_target(
+  fit,
+  expensive_model(index),
+  pattern = map(index),
+  resources = tar_resources(crew = tar_resources_crew(controller = "gpu"))
+)
+```
+
+Every controller `tiers` does not place elsewhere is in the `"default"` tier,
+which is where a target that names nothing goes, so at least one controller has
+to end up there. Reach for a tier when a machine has something the others lack
+— a GPU, a locally mounted dataset — when a class of target should get fewer
+slots than the rest, or when a metered cloud machine should only take work the
+local ones cannot.
+
+One machine can carry more than one tier, as `host1` does above. Its two
+controllers each launch their own workers, so `host_workers` caps the machine
+as a whole and the tiers cannot oversubscribe it between them. With one
+controller per machine it says nothing that `workers` does not, so leave it
+out. Naming one controller rather than a tier also works, as an escape hatch
+for pinning a target to one machine.
+
+### What this means for salvage
+
+The machines do not share a filesystem, so a salvaged result is readable only
+on the machine that saved it. That is why work already on a machine outranks
+free capacity: sending the target elsewhere would recompute hours that are
+already done, or already running. `remote_workers()` and `salvage_list()` are
+per-controller, so ask each one:
+
+```{r}
+lapply(tar_option_get("controller")$controllers, function(x) {
+  x$launcher$remote_workers()
+})
+```
+
+Keep the same package versions on every machine. A result saved under
+different versions of R or of any package is never reused, by design, so
+machines that drift apart stop reusing each other's salvaged work and
+recompute it instead, without an error anywhere to tell you. One container
+image, built once and pulled on each machine, is the easy way to hold them
+together.
+
 ## Run workers in a container
 
 `launch_prefix` runs each worker under another command instead of starting
