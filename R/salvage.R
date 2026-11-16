@@ -383,10 +383,44 @@ salvage_upstream_hash <- function(name, upstream) {
   c(name, class(target)[1L])
 }
 
+# How much of a key its readable part may take.
+salvage_prefix_chars <- 64L
+
 # Saved results are files named after their key, so the prefix keeps to
-# characters that need no quoting anywhere and cannot start an option.
+# characters that need no quoting anywhere and cannot start an option, and it
+# is capped so the name stays a sane length.
+#
+# A capped name no longer tells one task from another, and
+# salvage_has_state() compares these prefixes to decide whether a machine
+# holds a task's work.  The targets a model generates differ only in their
+# suffix -- _fit_simple against _data_simple -- so past the cap they read
+# alike, and a controller group would then place a fit on whichever machine
+# saved its data.  A capped prefix therefore ends in a digest of the whole
+# name.  The digest is of the name, not of what the task computes from, so
+# every version of one task still shares a prefix, which is what lets a saved
+# result of an earlier version count.
+#
+# A name within the cap comes out exactly as it did before, so keys already
+# on disk still compare and salvage_scheme need not move.  Two names that
+# sanitize alike still share a prefix; targets names cannot, since the
+# characters that collapse are ones a target name may not hold.
 salvage_prefix <- function(name) {
-  prefix <- substr(gsub("[^A-Za-z0-9._-]", "_", name), 1L, 64L)
+  clean <- gsub("[^A-Za-z0-9._-]", "_", name)
+  prefix <- substr(clean, 1L, salvage_prefix_chars)
+  capped <- nchar(clean) > salvage_prefix_chars
+  if (any(capped)) {
+    digest <- vapply(
+      clean[capped],
+      function(value) substr(rlang::hash(value), 1L, 8L),
+      character(1L),
+      USE.NAMES = FALSE
+    )
+    prefix[capped] <- paste0(
+      substr(clean[capped], 1L, salvage_prefix_chars - 9L),
+      "-",
+      digest
+    )
+  }
   prefix <- sub("^[.-]+", "", prefix)
   prefix[!nzchar(prefix)] <- "task"
   prefix
