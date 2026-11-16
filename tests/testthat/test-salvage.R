@@ -68,6 +68,47 @@ test_that("a NULL seed gives a different key from a set one", {
   )
 })
 
+test_that("salvage_prefix() tells apart names that differ past the cap", {
+  # The targets a model generates differ only in their suffix, so a long
+  # enough model name used to push the difference past the cap and make them
+  # share a prefix.
+  base <- strrep("m", 63L)
+  fit <- paste0(base, "_fit_simple")
+  data <- paste0(base, "_data_simple")
+  expect_false(identical(salvage_prefix(fit), salvage_prefix(data)))
+  expect_identical(nchar(salvage_prefix(fit)), 64L)
+  expect_identical(nchar(salvage_prefix(data)), 64L)
+  # So a result saved for the data target no longer makes the fit look held,
+  # which is what would have pinned the fit to that machine.
+  saved <- paste0(salvage_prefix(data), "-", strrep("a", 32L))
+  expect_false(salvage_has_state(fit, character(0L), saved))
+  expect_true(salvage_has_state(data, character(0L), saved))
+})
+
+test_that("salvage_prefix() still covers every version of one task", {
+  # The digest is of the name and not of what the task computes from, so two
+  # keys for the same long-named task share a prefix, which is what lets a
+  # saved result of an earlier version count.
+  name <- strrep("m", 80L)
+  saved <- paste0(salvage_prefix(name), "-", strrep("b", 32L))
+  expect_true(salvage_has_state(name, character(0L), saved))
+})
+
+test_that("salvage_key_prefix() recovers a capped prefix from its key", {
+  name <- strrep("m", 80L)
+  key <- paste0(salvage_prefix(name), "-", strrep("c", 32L))
+  expect_identical(salvage_key_prefix(key), salvage_prefix(name))
+})
+
+test_that("salvage_prefix() is vectorized over names", {
+  names <- c("short", strrep("n", 70L), "")
+  out <- salvage_prefix(names)
+  expect_length(out, 3L)
+  expect_identical(out[[1L]], "short")
+  expect_identical(nchar(out[[2L]]), 64L)
+  expect_identical(out[[3L]], "task")
+})
+
 test_that("salvage_prefix() keeps file names plain and safe", {
   expect_identical(salvage_prefix("fit"), "fit")
   expect_identical(salvage_prefix("fit model 1"), "fit_model_1")
@@ -79,7 +120,11 @@ test_that("salvage_prefix() keeps file names plain and safe", {
   expect_identical(salvage_prefix("--rf"), "rf")
   expect_identical(salvage_prefix(""), "task")
   expect_identical(salvage_prefix("..."), "task")
-  expect_identical(salvage_prefix(strrep("a", 100L)), strrep("a", 64L))
+  # A name past the cap keeps to the cap, and carries a digest of the whole
+  # name so that the prefix still tells one name from another.
+  long <- salvage_prefix(strrep("a", 100L))
+  expect_identical(nchar(long), 64L)
+  expect_match(long, "^a{55}-[0-9a-f]{8}$")
 })
 
 test_that("names that sanitize alike still get different keys", {
