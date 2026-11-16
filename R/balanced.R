@@ -11,15 +11,13 @@
 # the task's work, if there is one, and otherwise the one with the most free
 # capacity, within a cap on each machine.
 #
-# Placement and the backlog are what change. Collecting, scaling, waiting and
-# terminating already span every controller of a `crew` group. Draining does
-# not: a `crew` controller keeps its own backlog and releases from it only as
-# its own workers free up, so a task parked on a busy controller waits for
-# that controller even while another sits idle. `targets` parks a task only
-# once the whole group is saturated, which is exactly when no controller has
-# any free capacity to choose on, so placing it then is choosing blind. This
-# group therefore keeps one backlog of its own and places each task as it
-# comes off it.
+# The group also keeps the backlog. A `crew` controller keeps its own and
+# releases from it only as its own workers free up, so a task parked on a busy
+# controller waits for that controller even while another machine sits idle.
+# `targets` parks a task only once the whole group is saturated, which is
+# exactly when no controller has free capacity to choose on, so a controller
+# picked at that moment is picked blind. The group parks the task itself and
+# places it as it comes off the backlog.
 
 #' @title Balanced controller group
 #' @export
@@ -341,8 +339,16 @@ crew_class_controller_balanced <- R6::R6Class(
     #' @param name Character of length 1, the task name.
     #' @param controller `NULL`, a tier name, or a controller name.
     push_backlog = function(name, controller = NULL) {
-      # Rejects an unknown tier or controller here rather than at the drain,
-      # which is where the old placing push_backlog() would have rejected it.
+      crew::crew_assert(
+        name,
+        is.character(.),
+        length(.) == 1L,
+        !anyNA(.),
+        nzchar(.),
+        message = "name must be a single non-empty task name."
+      )
+      # Rejects an unknown tier or controller name here, where the push that
+      # supplied it is still on the stack, rather than at the drain.
       private$candidates(controller = controller)
       private$.backlog <- c(private$.backlog, name)
       private$.backlog_scopes <- c(
@@ -364,9 +370,10 @@ crew_class_controller_balanced <- R6::R6Class(
     #' @return Character vector of task names to push, held ones first.
     #' @param controllers Not used; a `crew` group accepts it.
     pop_backlog = function(controllers = NULL) {
-      if (!length(private$.backlog)) {
-        return(character(0L))
-      }
+      # backlog_held() runs even with nothing parked, because asking a
+      # launcher is also what clears a pass it granted for a task that went
+      # to another holder, and a pass left standing keeps that controller
+      # reporting itself unsaturated for good.
       held <- private$backlog_held()
       taken <- c(held, private$backlog_ready(held = held))
       out <- private$.backlog[taken]
@@ -526,14 +533,28 @@ crew_class_controller_balanced <- R6::R6Class(
     # The backlogged tasks the group has room for, as indices, in the order
     # they arrived. A slot is spent as it is counted, so two tiers sharing a
     # controller cannot both claim the same one. Held tasks are not counted
-    # against the room: each launcher caps its own, as it did when every
-    # controller drained its own backlog.
+    # against the room, because each launcher caps how many of its own it
+    # lets past saturation.
     backlog_ready = function(held) {
       room <- vapply(
         names(private$.controllers),
         function(name) max(0, private$free(name)),
         numeric(1L)
       )
+      # A machine's cap counts the tasks of every controller that shares it,
+      # so what is left of the cap is tracked alongside the per-controller
+      # room and spent with it.
+      caps <- private$.host_workers
+      spare <- numeric(0L)
+      if (length(caps)) {
+        spare <- vapply(
+          names(caps),
+          function(host) {
+            max(0, as.numeric(caps[[host]]) - private$host_load(host = host))
+          },
+          numeric(1L)
+        )
+      }
       out <- integer(0L)
       for (index in seq_along(private$.backlog)) {
         if (index %in% held) {
@@ -541,14 +562,33 @@ crew_class_controller_balanced <- R6::R6Class(
         }
         pool <- private$candidates(controller = private$backlog_scope(index))
         pool <- pool[room[pool] > 0]
+        pool <- pool[private$backlog_under_cap(pool = pool, spare = spare)]
         if (!length(pool)) {
           next
         }
         chosen <- pool[[which.max(room[pool])]]
         room[[chosen]] <- room[[chosen]] - 1
+        host <- private$.hosts[[chosen]]
+        if (host %in% names(spare)) {
+          spare[[host]] <- spare[[host]] - 1
+        }
         out <- c(out, index)
       }
       out
+    },
+    # Whether each controller of `pool` still has room under its machine's
+    # cap, given what the drain has already spent. A machine the caps do not
+    # name is not capped.
+    backlog_under_cap = function(pool, spare) {
+      vapply(
+        pool,
+        function(name) {
+          host <- private$.hosts[[name]]
+          !(host %in% names(spare)) || spare[[host]] > 0
+        },
+        logical(1L),
+        USE.NAMES = FALSE
+      )
     },
     # The tasks held by every controller of one machine.
     host_load = function(host) {

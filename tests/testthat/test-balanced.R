@@ -24,11 +24,17 @@ stub_controller <- function(
   launcher$name <- name
   launcher$workers <- workers
   launcher$ssh_host <- ssh_host
+  launcher$salvage_asks <- list()
   if (salvage) {
     launcher$salvage_holds <- function(names) intersect(names, holds)
     # The real one also caps how many pass at once and records them for the
     # controller's saturated() to read; the drain only needs which it holds.
-    launcher$salvage_backlog <- function(names) intersect(names, holds)
+    # Every ask is logged because asking resets those records, so how often
+    # the drain asks is part of the contract.
+    launcher$salvage_backlog <- function(names) {
+      launcher$salvage_asks <- c(launcher$salvage_asks, list(names))
+      intersect(names, holds)
+    }
   }
   out <- new.env(parent = emptyenv())
   out$launcher <- launcher
@@ -82,6 +88,14 @@ candidates <- function(group, controller = NULL) {
 
 backlog <- function(group) {
   group$.__enclos_env__$private$.backlog
+}
+
+backlog_scopes <- function(group) {
+  group$.__enclos_env__$private$.backlog_scopes
+}
+
+asks <- function(group, name) {
+  group$controllers[[name]]$launcher$salvage_asks
 }
 
 # Placement ----
@@ -300,9 +314,8 @@ test_that("pop_backlog() holds a task back while every controller is full", {
 })
 
 test_that("pop_backlog() releases on any controller's free capacity", {
-  # The drain reads the whole group's room. Draining each controller's own
-  # backlog at its own rate instead strands every task behind the single
-  # worker of "a", because a park while saturated had put them all there.
+  # The drain reads the whole group's room, so the two free slots on "b"
+  # release two tasks even though "a", which is full, is listed first.
   group <- stub_group(
     stub_controller("a", workers = 1L, size = 1L),
     stub_controller("b", workers = 2L, size = 0L)
@@ -362,6 +375,110 @@ test_that("pop_backlog() drains a group whose launchers have no salvage", {
   )
   group$push_backlog(name = "task")
   expect_identical(group$pop_backlog(), "task")
+  expect_identical(backlog(group), character(0L))
+})
+
+test_that("pop_backlog() asks every launcher even with nothing parked", {
+  group <- stub_group(
+    stub_controller("a", workers = 1L, size = 1L, holds = "stale"),
+    stub_controller("b", workers = 1L, size = 1L)
+  )
+  expect_identical(group$pop_backlog(), character(0L))
+  # Asking is also what clears a pass granted for a task that went to
+  # another holder. Skip the ask and that pass stands, and the controller
+  # reports itself unsaturated from then on.
+  expect_identical(asks(group, "a"), list(character(0L)))
+  expect_identical(asks(group, "b"), list(character(0L)))
+})
+
+test_that("pop_backlog() asks each launcher once, with the tasks it could take", {
+  group <- stub_group(
+    stub_controller("a", workers = 1L, size = 1L),
+    stub_controller("b", workers = 1L, size = 1L),
+    tiers = c(b = "slow")
+  )
+  group$push_backlog(name = "anywhere")
+  group$push_backlog(name = "slow_only", controller = "slow")
+  group$pop_backlog()
+  expect_length(asks(group, "a"), 1L)
+  expect_length(asks(group, "b"), 1L)
+  expect_identical(asks(group, "a")[[1L]], "anywhere")
+  expect_identical(asks(group, "b")[[1L]], "slow_only")
+})
+
+test_that("pop_backlog() returns held tasks first when they interleave", {
+  group <- stub_group(
+    stub_controller("a", workers = 2L, size = 0L),
+    stub_controller("b", workers = 1L, size = 1L, holds = "salvaged")
+  )
+  for (name in c("first", "salvaged", "second")) {
+    group$push_backlog(name = name)
+  }
+  expect_identical(group$pop_backlog(), c("salvaged", "first", "second"))
+  expect_identical(backlog(group), character(0L))
+})
+
+test_that("pop_backlog() keeps the scope of a task it holds back", {
+  group <- stub_group(
+    stub_controller("a", workers = 1L, size = 1L),
+    stub_controller("b", workers = 2L, size = 0L)
+  )
+  group$push_backlog(name = "pinned", controller = "a")
+  group$push_backlog(name = "anywhere")
+  expect_identical(group$pop_backlog(), "anywhere")
+  expect_identical(backlog(group), "pinned")
+  # The scope travels with the name, or the next drain treats a pinned task
+  # as runnable anywhere.
+  expect_identical(backlog_scopes(group), "a")
+})
+
+test_that("pop_backlog() releases a pinned task on its own controller's room", {
+  group <- stub_group(
+    stub_controller("a", workers = 1L, size = 0L),
+    stub_controller("b", workers = 1L, size = 1L)
+  )
+  group$push_backlog(name = "pinned", controller = "a")
+  expect_identical(group$pop_backlog(), "pinned")
+  expect_identical(backlog(group), character(0L))
+})
+
+test_that("pop_backlog() spends a shared slot once across scopes", {
+  group <- stub_group(
+    stub_controller("a", workers = 1L, size = 0L),
+    stub_controller("b", workers = 1L, size = 1L)
+  )
+  group$push_backlog(name = "pinned", controller = "a")
+  group$push_backlog(name = "anywhere")
+  # Both may run on "a", which has one slot, and "b" is full.
+  expect_identical(group$pop_backlog(), "pinned")
+  expect_identical(backlog(group), "anywhere")
+})
+
+test_that("pop_backlog() respects a machine's cap", {
+  group <- stub_group(
+    stub_controller("a", workers = 4L, size = 0L, ssh_host = "box"),
+    stub_controller("b", workers = 4L, size = 0L, ssh_host = "box"),
+    host_workers = c(box = 1L)
+  )
+  for (name in c("task1", "task2")) {
+    group$push_backlog(name = name)
+  }
+  # Eight free worker slots, but one machine holding both controllers and a
+  # cap of one task on it.
+  expect_identical(group$pop_backlog(), "task1")
+  expect_identical(backlog(group), "task2")
+})
+
+test_that("push_backlog() refuses a name that is not a single string", {
+  group <- stub_group(stub_controller("a", workers = 1L))
+  expect_error(
+    group$push_backlog(name = c("a", "b")),
+    "single non-empty task name"
+  )
+  expect_error(
+    group$push_backlog(name = NA_character_),
+    "single non-empty task name"
+  )
   expect_identical(backlog(group), character(0L))
 })
 

@@ -8,3 +8,4 @@ inst/examples/_targets/
 
 # testthat writes the failures of a run here.
 tests/testthat/_problems/
+tests/testthat/testthat-problems.rds
