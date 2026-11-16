@@ -78,6 +78,14 @@ processes that machine runs, which is what protects it.
 which is what keeps \code{targets} feeding the group while any machine has
 room instead of holding targets back because the first controller is
 full.
+
+When the group is saturated, \code{targets} parks the target instead, with
+\code{push_backlog()}. That backlog belongs to the group rather than to a
+controller: a \code{crew} controller releases from its own backlog only as
+its own workers free up, so a task parked on a busy controller would
+wait for that controller while another machine sat idle. Nothing is
+placed until the task comes off the backlog, which is the first moment
+the ranking above has free capacity to read.
 }
 \section{Tiers}{
 
