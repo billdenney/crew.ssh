@@ -25,6 +25,8 @@ Other balanced:
     \item \href{#method-crew_class_controller_balanced-push}{\code{crew_class_controller_balanced$push()}}
     \item \href{#method-crew_class_controller_balanced-saturated}{\code{crew_class_controller_balanced$saturated()}}
     \item \href{#method-crew_class_controller_balanced-push_backlog}{\code{crew_class_controller_balanced$push_backlog()}}
+    \item \href{#method-crew_class_controller_balanced-pop_backlog}{\code{crew_class_controller_balanced$pop_backlog()}}
+    \item \href{#method-crew_class_controller_balanced-terminate}{\code{crew_class_controller_balanced$terminate()}}
   }
 }
 \if{html}{\out{<details><summary>Inherited methods</summary>
@@ -39,7 +41,6 @@ Other balanced:
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="nonempty"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-nonempty'><code>crew::crew_class_controller_group$nonempty()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="pids"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-pids'><code>crew::crew_class_controller_group$pids()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="pop"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-pop'><code>crew::crew_class_controller_group$pop()</code></a></span></li>
-  <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="pop_backlog"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-pop_backlog'><code>crew::crew_class_controller_group$pop_backlog()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="resolved"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-resolved'><code>crew::crew_class_controller_group$resolved()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="scale"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-scale'><code>crew::crew_class_controller_group$scale()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="size"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-size'><code>crew::crew_class_controller_group$size()</code></a></span></li>
@@ -47,7 +48,6 @@ Other balanced:
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="started"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-started'><code>crew::crew_class_controller_group$started()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="summary"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-summary'><code>crew::crew_class_controller_group$summary()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="synced"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-synced'><code>crew::crew_class_controller_group$synced()</code></a></span></li>
-  <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="terminate"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-terminate'><code>crew::crew_class_controller_group$terminate()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="unresolved"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-unresolved'><code>crew::crew_class_controller_group$unresolved()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="wait"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-wait'><code>crew::crew_class_controller_group$wait()</code></a></span></li>
   <li><span class="pkg-link" data-pkg="crew" data-topic="crew_class_controller_group" data-id="walk"><a href='../../crew/html/crew_class_controller_group.html#method-crew_class_controller_group-walk'><code>crew::crew_class_controller_group$walk()</code></a></span></li>
@@ -199,8 +199,7 @@ earlier session left in flight, still does.
 \if{html}{\out{<a id="method-crew_class_controller_balanced-push_backlog"></a>}}
 \if{latex}{\out{\hypertarget{method-crew_class_controller_balanced-push_backlog}{}}}
 \subsection{\code{crew_class_controller_balanced$push_backlog()}}{
-  Add a task name to the backlog of the controller this
-group chooses for it.
+  Park a task name in the group's own backlog.
   \subsection{Usage}{
     \if{html}{\out{<div class="r">}}
     \preformatted{crew_class_controller_balanced$push_backlog(name, controller = NULL)}
@@ -213,6 +212,77 @@ group chooses for it.
       \item{\code{controller}}{\code{NULL}, a tier name, or a controller name.}
     }
     \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    The controller is not chosen here. \code{targets} parks a task
+only when the group reports itself saturated, so every candidate's
+free capacity is zero at this point and \code{place()} would be ranking
+ties. \code{pop_backlog()} chooses instead, once a controller has room.
+The scope the push asked for is kept with the name so that the drain
+counts only the controllers the task is allowed to run on.
+  }
+  \subsection{Returns}{
+    \code{NULL} (invisibly).
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_controller_balanced-pop_backlog"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_controller_balanced-pop_backlog}{}}}
+\subsection{\code{crew_class_controller_balanced$pop_backlog()}}{
+  Release the backlogged tasks the group has room for.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_controller_balanced$pop_backlog(controllers = NULL)}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Arguments}{
+    \if{html}{\out{<div class="arguments">}}
+    \describe{
+      \item{\code{controllers}}{Not used; a \code{crew} group accepts it.}
+    }
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    A task whose machine already holds its work goes out first,
+even while the group is saturated: the launcher holding it marks it
+so that its own \code{saturated()} lets the push through. A launcher with
+no salvage, such as a local, a cluster or a cloud one, holds nothing
+and is skipped, so a controller of any kind can join the group. The
+rest go out in the order they arrived, as many as the free capacity
+of the controllers each one may run on allows. Which controller a
+released task lands on is left to the push that follows, where
+\code{place()} sees capacity that means something.
+  }
+  \subsection{Returns}{
+    Character vector of task names to push, held ones first.
+  }
+}
+
+\if{html}{\out{<hr>}}
+\if{html}{\out{<a id="method-crew_class_controller_balanced-terminate"></a>}}
+\if{latex}{\out{\hypertarget{method-crew_class_controller_balanced-terminate}{}}}
+\subsection{\code{crew_class_controller_balanced$terminate()}}{
+  Terminate the group and forget the tasks it has parked.
+  \subsection{Usage}{
+    \if{html}{\out{<div class="r">}}
+    \preformatted{crew_class_controller_balanced$terminate(controllers = NULL)}
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Arguments}{
+    \if{html}{\out{<div class="arguments">}}
+    \describe{
+      \item{\code{controllers}}{\code{NULL} for every controller, or a character
+vector of controller names, as in \code{\link[crew:crew_controller_group]{crew::crew_controller_group()}}.}
+    }
+    \if{html}{\out{</div>}}
+  }
+  \subsection{Details}{
+    A \code{crew} controller empties its own backlog as it
+terminates, and the group empties the one it keeps for the same
+reason: a group started again must not release names the last run
+parked. Terminating named controllers keeps the backlog, because
+those tasks may still run on a controller that is staying up.
   }
   \subsection{Returns}{
     \code{NULL} (invisibly).
